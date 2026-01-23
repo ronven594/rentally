@@ -3,6 +3,15 @@ import { Resend } from 'resend';
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 /**
+ * Email attachment interface
+ */
+export interface EmailAttachment {
+    filename: string;
+    content: Buffer | string; // Buffer for binary, base64 string also supported
+    contentType?: string;
+}
+
+/**
  * Sends a professional notice email using Resend.
  * Includes a development mode check to prevent real emails from being sent during testing.
  */
@@ -38,6 +47,71 @@ export async function sendNoticeEmail(to: string, subject: string, body: string)
 
         console.log(`✅ Email sent successfully! ID: ${data?.id}`);
         return { success: true, id: data?.id };
+    } catch (err: any) {
+        console.error('❌ Mail Service Exception:', err.message);
+        return { success: false, error: err.message };
+    }
+}
+
+/**
+ * Sends a notice email with PDF attachment using Resend.
+ * The PDF contains the official legal notice while the email body is a cover note.
+ *
+ * @param to - Recipient email address
+ * @param subject - Email subject line
+ * @param coverNote - HTML cover note for the email body
+ * @param attachment - PDF attachment with filename and content
+ */
+export async function sendNoticeEmailWithAttachment(
+    to: string,
+    subject: string,
+    coverNote: string,
+    attachment: EmailAttachment
+) {
+    const isDev = process.env.NODE_ENV === 'development';
+
+    if (isDev) {
+        console.log('✉️ [DEVELOPMENT MODE: MAIL LOG WITH ATTACHMENT]');
+        console.log(`To: ${to}`);
+        console.log(`Subject: ${subject}`);
+        console.log(`Cover Note: ${coverNote.substring(0, 200)}...`);
+        console.log(`Attachment: ${attachment.filename} (${typeof attachment.content === 'string' ? attachment.content.length : attachment.content.length} bytes)`);
+        console.log('-------------------------------');
+        return { success: true, mode: 'development', attachmentFilename: attachment.filename };
+    }
+
+    if (!process.env.RESEND_API_KEY) {
+        console.error('❌ Configuration Error: RESEND_API_KEY is missing.');
+        return { success: false, error: 'API Key missing' };
+    }
+
+    try {
+        // Convert Buffer to base64 if needed
+        const contentBase64 = Buffer.isBuffer(attachment.content)
+            ? attachment.content.toString('base64')
+            : attachment.content;
+
+        const { data, error } = await resend.emails.send({
+            from: 'Landlord App <onboarding@resend.dev>',
+            to: [to],
+            subject: subject,
+            html: coverNote,
+            attachments: [
+                {
+                    filename: attachment.filename,
+                    content: contentBase64,
+                    contentType: attachment.contentType || 'application/pdf',
+                },
+            ],
+        });
+
+        if (error) {
+            console.error('❌ Resend Error:', error);
+            return { success: false, error };
+        }
+
+        console.log(`✅ Email with attachment sent successfully! ID: ${data?.id}`);
+        return { success: true, id: data?.id, attachmentFilename: attachment.filename };
     } catch (err: any) {
         console.error('❌ Mail Service Exception:', err.message);
         return { success: false, error: err.message };

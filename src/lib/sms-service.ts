@@ -2,7 +2,7 @@ import twilio from 'twilio';
 
 const accountSid = process.env.TWILIO_ACCOUNT_SID;
 const authToken = process.env.TWILIO_AUTH_TOKEN;
-const twilioNumber = process.env.TWILIO_TRIAL_NUMBER;
+const twilioNumber = process.env.TWILIO_PHONE_NUMBER;
 
 // Initialize client lazily or handle missing keys gracefully for dev
 const client = accountSid && authToken ? twilio(accountSid, authToken) : null;
