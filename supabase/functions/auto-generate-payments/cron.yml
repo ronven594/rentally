@@ -1,0 +1,5 @@
+project_id: "your-project-id"
+functions:
+  auto-generate-payments:
+    schedule: "1 0 * * *"  # Runs at 12:01 AM every day
+    timezone: "Pacific/Auckland"
