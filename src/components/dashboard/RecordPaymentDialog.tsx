@@ -2,8 +2,10 @@ import { useState } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { Tenant } from "@/types";
 import { toast } from "sonner";
+import { DollarSign } from "lucide-react";
 
 interface RecordPaymentDialogProps {
     open: boolean;
@@ -52,37 +54,40 @@ export function RecordPaymentDialog({
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="sm:max-w-md bg-white">
-                <DialogHeader>
-                    <DialogTitle className="font-black italic text-nav-black">Record Payment - {tenant.name}</DialogTitle>
+            <DialogContent className="sm:max-w-md">
+                <DialogHeader className="mb-4">
+                    <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-[#00FFBB]/10 rounded-xl flex items-center justify-center">
+                            <DollarSign className="w-5 h-5 text-[#00FFBB]" />
+                        </div>
+                        <DialogTitle>Record Payment - {tenant.name}</DialogTitle>
+                    </div>
                 </DialogHeader>
 
-                <div className="space-y-4 py-4">
+                <div className="space-y-4">
                     {/* Outstanding Amount */}
-                    <div className="bg-slate-50 border border-slate-200 rounded-lg p-4">
-                        <p className="text-xs text-slate-600 mb-1">Total Outstanding</p>
-                        <p className="text-2xl font-bold text-slate-900">${totalOutstanding.toFixed(2)}</p>
+                    <div className="bg-white/5 border border-white/10 rounded-xl p-4">
+                        <p className="text-xs text-white/50 mb-1 uppercase tracking-wider font-bold">Total Outstanding</p>
+                        <p className="text-2xl font-black text-[#FFB800] tabular-nums">${totalOutstanding.toFixed(2)}</p>
                     </div>
 
                     {/* Payment Amount Input */}
-                    <div>
-                        <label className="text-sm font-medium text-slate-700 mb-2 block">
-                            Payment Received
-                        </label>
-                        <div className="relative">
-                            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 font-medium">$</span>
+                    <div className="space-y-2">
+                        <Label>Payment Received</Label>
+                        <div className="relative group">
+                            <span className="absolute left-4 top-1/2 -translate-y-1/2 text-white/40 group-focus-within:text-[#00FFBB] font-medium">$</span>
                             <Input
                                 type="number"
                                 value={paymentAmount}
                                 onChange={(e) => setPaymentAmount(e.target.value)}
-                                className="pl-8 text-lg font-semibold"
+                                className="pl-10 text-lg font-bold tabular-nums"
                                 placeholder="0.00"
                                 step="0.01"
                                 min="0"
                                 max={totalOutstanding}
                             />
                         </div>
-                        <p className="text-xs text-slate-500 mt-1">
+                        <p className="text-xs text-white/40 font-medium">
                             Payment will be applied to oldest debt first
                         </p>
                     </div>
@@ -91,7 +96,7 @@ export function RecordPaymentDialog({
                     <div className="flex gap-2">
                         <Button
                             type="button"
-                            variant="outline"
+                            variant="brand-secondary"
                             size="sm"
                             onClick={() => setPaymentAmount((totalOutstanding / 2).toFixed(2))}
                             className="flex-1"
@@ -100,7 +105,7 @@ export function RecordPaymentDialog({
                         </Button>
                         <Button
                             type="button"
-                            variant="outline"
+                            variant="brand-secondary"
                             size="sm"
                             onClick={() => setPaymentAmount(totalOutstanding.toString())}
                             className="flex-1"
@@ -110,10 +115,11 @@ export function RecordPaymentDialog({
                     </div>
                 </div>
 
-                <DialogFooter className="gap-2">
+                <DialogFooter className="gap-2 pt-4">
                     <Button
                         type="button"
-                        variant="outline"
+                        variant="brand-secondary"
+                        size="brand"
                         onClick={() => onOpenChange(false)}
                         disabled={isProcessing}
                     >
@@ -123,7 +129,8 @@ export function RecordPaymentDialog({
                         type="button"
                         onClick={handleSubmit}
                         disabled={isProcessing}
-                        className="bg-safe-green hover:bg-safe-green/90 text-white font-black"
+                        variant="brand-accent"
+                        className="h-12 px-6 rounded-xl"
                     >
                         {isProcessing ? 'Recording...' : 'Record Payment'}
                     </Button>

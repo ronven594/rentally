@@ -484,8 +484,11 @@ export function getValidStrikesInWindow(strikes: StrikeRecord[], currentDate: Da
  * Calculates total days in arrears based on unpaid rent ledger entries.
  * Uses the oldest unpaid due date to calculate arrears days.
  *
+ * CRITICAL: All dates are normalized to startOfDay to avoid timezone issues.
+ * This ensures consistent day calculations regardless of server timezone.
+ *
  * @param ledger - Array of ledger entries
- * @param currentDate - Current date for calculation
+ * @param currentDate - Current date for calculation (will be normalized)
  * @returns Number of calendar days in arrears
  */
 export function calculateDaysInArrears(ledger: LedgerEntry[], currentDate: Date = new Date()): number {
@@ -495,18 +498,23 @@ export function calculateDaysInArrears(ledger: LedgerEntry[], currentDate: Date 
 
     if (unpaidEntries.length === 0) return 0;
 
-    // Find oldest unpaid due date
+    // Find oldest unpaid due date (normalized to start of day)
     const oldestDueDate = unpaidEntries
-        .map(e => parseISO(e.dueDate))
+        .map(e => startOfDay(parseISO(e.dueDate)))
         .sort((a, b) => a.getTime() - b.getTime())[0];
 
-    const daysArrears = differenceInCalendarDays(currentDate, oldestDueDate);
+    // Normalize currentDate as well for consistent comparison
+    const normalizedCurrent = startOfDay(currentDate);
+
+    const daysArrears = differenceInCalendarDays(normalizedCurrent, oldestDueDate);
     return Math.max(0, daysArrears);
 }
 
 /**
  * Calculates working days overdue for a specific rent payment.
  * A strike can be issued after 5 working days overdue.
+ *
+ * CRITICAL: All dates are normalized to startOfDay to avoid timezone issues.
  *
  * @param dueDate - Rent due date
  * @param currentDate - Current date
@@ -518,13 +526,16 @@ export function calculateWorkingDaysOverdue(
     currentDate: Date = new Date(),
     region?: NZRegion
 ): number {
-    const due = typeof dueDate === "string" ? parseISO(dueDate) : dueDate;
+    // Normalize both dates to start of day for consistent comparison
+    const due = startOfDay(typeof dueDate === "string" ? parseISO(dueDate) : dueDate);
+    const normalizedCurrent = startOfDay(currentDate);
 
-    if (isBefore(currentDate, due) || isEqual(currentDate, due)) {
+    // If currentDate <= dueDate, not overdue yet
+    if (isBefore(normalizedCurrent, due) || isEqual(normalizedCurrent, due)) {
         return 0;
     }
 
-    return countWorkingDays(due, currentDate, region);
+    return countWorkingDays(due, normalizedCurrent, region);
 }
 
 /**
@@ -555,7 +566,11 @@ export function calculateTotalArrears(ledger: LedgerEntry[]): number {
  */
 export function analyzeTenancySituation(input: AnalysisInput): AnalysisResult {
     const { strikeHistory, behaviorNotes, region, trackingStartDate, openingArrears = 0 } = input;
-    const currentDate = input.currentDate || new Date();
+    // CRITICAL: Normalize currentDate to start of day in NZ timezone for consistent date comparisons
+    // This ensures status shifts at 12:01 AM NZ time, not server time
+    // toZonedTime converts to NZ local, then startOfDay normalizes to midnight
+    const currentDateNZ = toZonedTime(input.currentDate || new Date(), NZ_TIMEZONE);
+    const currentDate = startOfDay(currentDateNZ);
 
     // 1. FILTER LEDGER FOR "GHOST PAYMENTS"
     // If tracking start date is provided, filter out any payments due BEFORE we started tracking
@@ -567,9 +582,11 @@ export function analyzeTenancySituation(input: AnalysisInput): AnalysisResult {
     // 2. FILTER LEDGER FOR FUTURE PAYMENTS
     // CRITICAL: Only include payments that are due on or before the current date
     // Payments due in the future should NOT count toward arrears (they're not yet due)
+    // NOTE: Normalize dueDate to startOfDay to avoid timezone issues where
+    // parseISO("2026-01-25") creates UTC midnight (not local midnight)
     ledger = ledger.filter(entry => {
-        const dueDate = parseISO(entry.dueDate);
-        // Include only if dueDate <= currentDate
+        const dueDate = startOfDay(parseISO(entry.dueDate));
+        // Include only if dueDate <= currentDate (both normalized to start of day)
         return isBefore(dueDate, currentDate) || isEqual(dueDate, currentDate);
     });
 

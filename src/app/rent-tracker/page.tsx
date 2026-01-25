@@ -6,13 +6,12 @@ import { AddTenantDialog } from "@/components/dashboard/AddTenantDialog"
 import { AddPropertyDialog } from "@/components/dashboard/AddPropertyDialog"
 import { ManageTenantDialog } from "@/components/dashboard/ManageTenantDialog"
 import { ConfirmationDialog } from "@/components/dashboard/ConfirmationDialog"
-import { Property, Tenant, RentPayment, PaymentStatus } from "@/types"
+import { Property, Tenant, RentPayment, PaymentStatus, PaymentFrequency, PaymentHistoryEntry } from "@/types"
 import { differenceInCalendarDays, parseISO, format, addDays, addMonths, startOfDay } from "date-fns"
 import { calculateDueDates } from "@/lib/payment-automation"
 import { logToEvidenceLedger, EVENT_TYPES, CATEGORIES } from "@/services/evidenceLedger"
 import { Plus, Building2, Users, AlertCircle, Loader2 } from "lucide-react"
 import { UpcomingObligations } from "@/components/dashboard/UpcomingObligations"
-import { PortfolioReassuranceBanner } from "@/components/dashboard/PortfolioReassuranceBanner"
 import { getObligationMessages } from "@/lib/status-engine"
 import { Button } from "@/components/ui/button"
 import { toast } from "sonner"
@@ -80,7 +79,12 @@ export default function RentTrackerPage() {
                         tenant_address: t.tenant_address,
                         frequency: t.rent_frequency || "Weekly",
                         startDate: t.lease_start_date,
+                        trackingStartDate: t.tracking_start_date, // CRITICAL: When we started tracking (for legal engine)
+                        openingArrears: t.opening_arrears || 0,   // CRITICAL: Pre-existing debt (for legal engine)
                         rentDueDay: t.rent_due_day || "Wednesday",
+                        sentNotices: t.sent_notices || [],        // 90-day rolling strike history
+                        remedyNoticeSentAt: t.remedy_notice_sent_at, // 14-day notice to remedy
+                        paymentHistory: t.payment_history || [],  // Payment history for modal
                         strikeHistory: [],
                         createdAt: t.created_at
                     };
@@ -420,6 +424,8 @@ export default function RentTrackerPage() {
                     currentDate: testDate || undefined,
                     trackingStartDate: tenant.trackingStartDate || tenant.startDate, // When we started tracking (or lease start as fallback)
                     openingArrears: tenant.openingArrears || 0, // Any existing debt when we started tracking
+                    frequency: tenant.frequency, // For firstMissedDueDate calculation
+                    rentDueDay: tenant.rentDueDay, // For firstMissedDueDate calculation
                 });
             });
         });
@@ -475,6 +481,16 @@ export default function RentTrackerPage() {
 
             if (!tenant || !property) throw new Error("Tenant or Property not found");
 
+            // Helper: Calculate cycle days based on tenant frequency
+            const getCycleDays = (frequency: PaymentFrequency): number => {
+                switch (frequency) {
+                    case 'Weekly': return 7;
+                    case 'Fortnightly': return 14;
+                    case 'Monthly': return 30; // Approximate for partial payment calculations
+                    default: return 7;
+                }
+            };
+
             // Apply payment to oldest debts first
             for (const payment of unpaidPayments) {
                 if (remainingPayment <= 0.01) break; // Use small epsilon for float safety
@@ -492,8 +508,33 @@ export default function RentTrackerPage() {
                 // Determine new status
                 const isFullyPaid = newAmountPaid >= (payment.amount - 0.01);
                 const newStatus = isFullyPaid ? 'Paid' : 'Partial';
-                // Use the payment date from the modal (already ISO format from date input)
-                const paidDate = isFullyPaid ? new Date(paymentDate).toISOString() : null;
+
+                // FREQUENCY-AWARE PAID DATE CALCULATION
+                // CRITICAL: Use DELTA ADDITION, not total recalculation
+                let paidDate: string | null = null;
+
+                if (isFullyPaid) {
+                    // Full payment: advance by full cycle
+                    const cycleDays = getCycleDays(tenant.frequency);
+                    // Start from current paid_date if it exists, otherwise from due_date
+                    const startDate = payment.paid_date ? parseISO(payment.paid_date) : parseISO(payment.due_date);
+                    const paidUntilDate = addDays(startDate, cycleDays);
+                    // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
+                    paidDate = format(paidUntilDate, 'yyyy-MM-dd');
+                } else {
+                    // Partial payment: advance proportionally by the DELTA only
+                    // Formula: AdditionalDays = (AmountToApply / CycleRentAmount) * CycleDays
+                    const cycleDays = getCycleDays(tenant.frequency);
+                    const additionalCoverageRatio = amountToApply / payment.amount; // Only the NEW payment
+                    const additionalDays = additionalCoverageRatio * cycleDays;
+
+                    // CRITICAL: Use Math.round() to minimize rounding error accumulation
+                    // Start from CURRENT paid_date (or due_date if first payment)
+                    const startDate = payment.paid_date ? parseISO(payment.paid_date) : parseISO(payment.due_date);
+                    const paidUntilDate = addDays(startDate, Math.round(additionalDays));
+                    // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
+                    paidDate = format(paidUntilDate, 'yyyy-MM-dd');
+                }
 
                 console.log(`⚠️ Allocating to payment:`, {
                     paymentId: payment.id,
@@ -555,6 +596,29 @@ export default function RentTrackerPage() {
                 }
             );
 
+            // Add payment to tenant's payment history
+            const paymentHistoryEntry: PaymentHistoryEntry = {
+                id: crypto.randomUUID(),
+                amount: paymentAmount,
+                date: paymentDate,
+                method: 'Bank Transfer', // Default method
+                timestamp: new Date().toISOString()
+            };
+
+            // Update tenant's paymentHistory in database
+            const currentHistory = tenant.paymentHistory || [];
+            const updatedHistory = [paymentHistoryEntry, ...currentHistory];
+
+            const { error: historyUpdateError } = await supabase
+                .from('tenants')
+                .update({ payment_history: updatedHistory })
+                .eq('id', tenantId);
+
+            if (historyUpdateError) {
+                console.error('⚠️ Failed to update payment history:', historyUpdateError);
+                // Don't throw - payment was recorded, history is just a nice-to-have
+            }
+
             toast.success("Payment recorded successfully");
 
             console.log('🔄 Refreshing data...');
@@ -565,6 +629,178 @@ export default function RentTrackerPage() {
         } catch (error: any) {
             console.error('❌ Record payment error:', error);
             toast.error("Failed to record payment");
+        }
+    };
+
+    // Void a payment (reverse payment reconciliation)
+    const handleVoidPayment = async (tenantId: string, paymentId: string) => {
+        try {
+            console.log('🔄 VOID PAYMENT:', { tenantId, paymentId });
+
+            // Find tenant and payment history entry
+            let flatTenants: Tenant[] = [];
+            properties.forEach(p => flatTenants.push(...p.tenants));
+            const tenant = flatTenants.find(t => t.id === tenantId);
+            const property = properties.find(p => p.tenants.some(t => t.id === tenantId));
+
+            if (!tenant || !property) throw new Error("Tenant or Property not found");
+
+            const paymentHistory = tenant.paymentHistory || [];
+            const paymentToVoid = paymentHistory.find(p => p.id === paymentId);
+
+            if (!paymentToVoid) {
+                toast.error("Payment not found");
+                return;
+            }
+
+            // Get all payments for this tenant (most recent first for voiding)
+            const { data: allPayments, error: fetchError } = await supabase
+                .from('payments')
+                .select('*')
+                .eq('tenant_id', tenantId)
+                .order('due_date', { ascending: false }); // NEWEST FIRST for voiding
+
+            if (fetchError) throw fetchError;
+
+            if (!allPayments || allPayments.length === 0) {
+                toast.error('No payment records found');
+                return;
+            }
+
+            // Helper: Calculate cycle days based on tenant frequency
+            const getCycleDays = (frequency: PaymentFrequency): number => {
+                switch (frequency) {
+                    case 'Weekly': return 7;
+                    case 'Fortnightly': return 14;
+                    case 'Monthly': return 30;
+                    default: return 7;
+                }
+            };
+
+            // Reverse the payment by subtracting from newest payments first
+            let amountToReverse = paymentToVoid.amount;
+            const paymentsToUpdate: { id: string, status: string, paid_date: string | null, amount_paid: number }[] = [];
+
+            for (const payment of allPayments) {
+                if (amountToReverse <= 0.01) break;
+
+                const currentAmountPaid = payment.amount_paid || 0;
+                if (currentAmountPaid <= 0) continue; // Skip unpaid payments
+
+                // How much can we reverse from this payment?
+                const amountToDeduct = Math.min(amountToReverse, currentAmountPaid);
+                const newAmountPaid = currentAmountPaid - amountToDeduct;
+
+                // Determine new status
+                const isFullyPaid = newAmountPaid >= (payment.amount - 0.01);
+                const newStatus = newAmountPaid <= 0.01 ? 'Unpaid' : isFullyPaid ? 'Paid' : 'Partial';
+
+                // Recalculate paid_date by SUBTRACTING the delta
+                let paidDate: string | null = null;
+
+                if (newStatus === 'Paid') {
+                    // Still fully paid: paid_date stays the same
+                    paidDate = payment.paid_date;
+                } else if (newStatus === 'Partial') {
+                    // Was fully paid, now partial: subtract the reversed amount's days
+                    const cycleDays = getCycleDays(tenant.frequency);
+                    const reversedCoverageRatio = amountToDeduct / payment.amount;
+                    const daysToSubtract = reversedCoverageRatio * cycleDays;
+
+                    // CRITICAL: Subtract from CURRENT paid_date, use Math.round() for precision
+                    if (payment.paid_date) {
+                        const currentPaidDate = parseISO(payment.paid_date);
+                        const newPaidUntilDate = addDays(currentPaidDate, -Math.round(daysToSubtract));
+                        // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
+                        paidDate = format(newPaidUntilDate, 'yyyy-MM-dd');
+                    } else {
+                        // Fallback: shouldn't happen, but recalculate from due_date if no paid_date
+                        const dueDateObj = parseISO(payment.due_date);
+                        const coverageRatio = newAmountPaid / payment.amount;
+                        const daysToAdd = coverageRatio * cycleDays;
+                        const paidUntilDate = addDays(dueDateObj, Math.round(daysToAdd));
+                        // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
+                        paidDate = format(paidUntilDate, 'yyyy-MM-dd');
+                    }
+                }
+                // If Unpaid, paidDate remains null
+
+                console.log(`🔙 Reversing payment:`, {
+                    paymentId: payment.id,
+                    dueDate: payment.due_date,
+                    previousAmountPaid: currentAmountPaid,
+                    amountToDeduct,
+                    newAmountPaid,
+                    newStatus
+                });
+
+                paymentsToUpdate.push({
+                    id: payment.id,
+                    status: newStatus,
+                    paid_date: paidDate,
+                    amount_paid: newAmountPaid
+                });
+
+                amountToReverse -= amountToDeduct;
+            }
+
+            // Update all affected payments
+            for (const update of paymentsToUpdate) {
+                const { error: updateError } = await supabase
+                    .from('payments')
+                    .update({
+                        status: update.status,
+                        paid_date: update.paid_date,
+                        amount_paid: update.amount_paid
+                    })
+                    .eq('id', update.id);
+
+                if (updateError) {
+                    console.error('❌ Failed to update payment:', update.id, updateError);
+                    throw updateError;
+                }
+
+                console.log('✅ Reversed payment:', update.id);
+            }
+
+            // Remove payment from tenant's payment history
+            const updatedHistory = paymentHistory.filter(p => p.id !== paymentId);
+
+            const { error: historyUpdateError } = await supabase
+                .from('tenants')
+                .update({ payment_history: updatedHistory })
+                .eq('id', tenantId);
+
+            if (historyUpdateError) {
+                throw historyUpdateError;
+            }
+
+            // Log the void action
+            await logToEvidenceLedger(
+                property.id,
+                tenantId,
+                EVENT_TYPES.RENT_PAID,
+                CATEGORIES.PAYMENT,
+                `Payment voided: $${paymentToVoid.amount.toFixed(2)}`,
+                `Payment of $${paymentToVoid.amount.toFixed(2)} from ${format(parseISO(paymentToVoid.date), 'MMM d, yyyy')} was voided. ${paymentsToUpdate.length} payment record(s) reversed.`,
+                {
+                    voidedAmount: paymentToVoid.amount,
+                    voidedDate: paymentToVoid.date,
+                    paymentId,
+                    debtsReversed: paymentsToUpdate.length
+                }
+            );
+
+            toast.success("Payment voided successfully");
+
+            console.log('🔄 Refreshing data...');
+            await fetchPayments();
+            await fetchProperties();
+            console.log('✅ Data refresh complete');
+
+        } catch (error: any) {
+            console.error('❌ Void payment error:', error);
+            toast.error("Failed to void payment");
         }
     };
 
@@ -736,39 +972,55 @@ export default function RentTrackerPage() {
     };
 
     // Build portfolio status from legal statuses
-    const { obligations, isPortfolioSweetAs } = useMemo(() => {
-        const tenantObligations: Array<{ name: string; propertyAddress: string; daysLate: number; calendarDays?: number }> = [];
-        let allSweetAs = true;
+    const { obligations, globalSeverityRank } = useMemo(() => {
+        const tenantObligations: Array<{ name: string; propertyAddress: string; daysLate: number; calendarDays?: number; activeStrikeCount: number }> = [];
+        let maxRank = 1; // Start with lowest severity
 
         properties.forEach(property => {
             property.tenants.forEach(tenant => {
                 const legalStatus = tenantLegalStatuses[tenant.id];
                 if (!legalStatus) return;
 
-                // Check if any tenant is not sweet as
-                if (legalStatus.status !== 'CLEAR') {
-                    allSweetAs = false;
+                // Calculate severity rank for this tenant (same logic as PropertyCard)
+                const { daysOverdue, workingDaysOverdue, totalBalanceDue, activeStrikeCount = 0 } = legalStatus;
+
+                // Skip if paid
+                if (totalBalanceDue > 0) {
+                    // RANK 5: RED_BREATHING (Termination - 21+ days OR 3 strikes)
+                    if (daysOverdue >= 21 || activeStrikeCount >= 3) {
+                        maxRank = Math.max(maxRank, 5);
+                    }
+                    // RANK 4: RED_SOLID (10-20 days overdue)
+                    else if (workingDaysOverdue >= 10) {
+                        maxRank = Math.max(maxRank, 4);
+                    }
+                    // RANK 3: GOLD_SOLID (5-9 days overdue)
+                    else if (workingDaysOverdue >= 5) {
+                        maxRank = Math.max(maxRank, 3);
+                    }
+                    // RANK 2: AMBER_OUTLINE (1-4 days overdue)
+                    else if (workingDaysOverdue >= 1) {
+                        maxRank = Math.max(maxRank, 2);
+                    }
                 }
 
                 // Collect obligations for the banner
-                // Include ALL overdue states: Monitor (1+ calendar days), Strike 1 (5+), Strike 2+ (10+)
+                // Include ALL overdue states: Payment Pending (0 strikes), Strike 1, Strike 2+
                 if (legalStatus.daysOverdue >= 1) {
                     tenantObligations.push({
                         name: tenant.name,
                         propertyAddress: property.address,
                         daysLate: legalStatus.workingDaysOverdue,  // Use working days for legal compliance
                         calendarDays: legalStatus.daysOverdue,     // Calendar days for Monitor phase display
+                        activeStrikeCount: legalStatus.activeStrikeCount || 0, // CRITICAL: Strike count for severity
                     });
                 }
             });
         });
 
-        // Portfolio is sweet as only if there are tenants and all are good
-        const hasTenants = properties.some(p => p.tenants.length > 0);
-
         return {
             obligations: getObligationMessages(tenantObligations),
-            isPortfolioSweetAs: hasTenants && allSweetAs,
+            globalSeverityRank: maxRank as 1 | 2 | 3 | 4 | 5,
         };
     }, [properties, tenantLegalStatuses]);
 
@@ -825,11 +1077,8 @@ export default function RentTrackerPage() {
 
             {/* Main Content - Full Width Command Center */}
             <div className="max-w-7xl mx-auto px-6 py-8">
-                {/* Portfolio-wide Reassurance Banner */}
-                <PortfolioReassuranceBanner show={isPortfolioSweetAs} />
-
-                {/* Smart Triage Banner (only shows if there are obligations) */}
-                <UpcomingObligations obligations={obligations} />
+                {/* Global Portfolio Severity Banner (Rank 1-5 with "CHOICE!" for all-paid state) */}
+                <UpcomingObligations obligations={obligations} globalSeverityRank={globalSeverityRank} />
 
                 {loading ? (
                     <div className="py-20 flex flex-col items-center justify-center space-y-4">
@@ -882,6 +1131,7 @@ export default function RentTrackerPage() {
                                 tenantLegalStatuses={tenantLegalStatuses}
                                 testDate={testDate || undefined}
                                 onRecordPayment={handleRecordPayment}
+                                onVoidPayment={handleVoidPayment}
                                 onManageTenant={(tid) => setManagingTenantId(tid)}
                                 onDeleteTenant={handleDeleteTenant}
                                 onAddTenant={handleAddTenant}
@@ -927,10 +1177,10 @@ export default function RentTrackerPage() {
 
             {/* Floating Action Button - Neon Mint */}
             <Button
-                variant="brand"
+                variant="brand-accent"
                 size="brand"
                 onClick={() => setIsAddPropertyOpen(true)}
-                className="fixed bottom-24 right-4 shadow-[0_0_20px_rgba(0,255,187,0.3)] hover:scale-105 z-40 bg-[#00FFBB] text-[#0B0E11] hover:shadow-[0_0_30px_rgba(0,255,187,0.5)]"
+                className="fixed bottom-24 right-4 hover:scale-105 z-40"
             >
                 <Plus className="w-4 h-4" />
                 ADD PROPERTY

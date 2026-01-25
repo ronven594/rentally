@@ -12,7 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Tenant, PaymentFrequency } from "@/types"
-import { User, Mail, Phone, Calendar, Loader2 } from "lucide-react"
+import { User, Mail, Phone, Calendar, Loader2, UserPlus } from "lucide-react"
 import { supabase } from "@/lib/supabaseClient"
 import { toast } from "sonner"
 import { format } from "date-fns"
@@ -157,275 +157,264 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="sm:max-w-[450px] bg-white border border-slate-200 shadow-xl rounded-2xl p-0 overflow-hidden">
-                <div className="bg-slate-50/50 px-6 py-4 border-b border-slate-100">
-                    <DialogHeader>
-                        <DialogTitle className="text-xl font-black italic text-nav-black tracking-tight">Add New Tenant</DialogTitle>
-                    </DialogHeader>
-                </div>
+            <DialogContent className="sm:max-w-[425px] flex flex-col">
+                <DialogHeader className="flex-shrink-0">
+                    <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-[#00FFBB]/10 rounded-xl flex items-center justify-center">
+                            <UserPlus className="w-5 h-5 text-[#00FFBB]" />
+                        </div>
+                        <DialogTitle>Add New Tenant</DialogTitle>
+                    </div>
+                </DialogHeader>
 
-                <form onSubmit={handleSubmit} className="p-6 space-y-5">
-                    {/* Names */}
-                    <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                            <Label htmlFor="firstName" className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                                First Name
-                            </Label>
-                            <div className="relative group">
-                                <User className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-emerald-500 transition-colors" />
+                <form onSubmit={handleSubmit} className="flex flex-col flex-1 min-h-0">
+                    {/* Scrollable content area */}
+                    <div className="max-h-[70vh] overflow-y-auto pr-2 space-y-5 custom-scrollbar">
+                        {/* Names */}
+                        <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                                <Label htmlFor="firstName">First Name</Label>
+                                <div className="relative group">
+                                    <User className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 group-focus-within:text-[#00FFBB] transition-colors" />
+                                    <Input
+                                        id="firstName"
+                                        value={firstName}
+                                        onChange={(e) => setFirstName(e.target.value)}
+                                        placeholder="e.g. John"
+                                        className="pl-11"
+                                        required
+                                    />
+                                </div>
+                            </div>
+                            <div className="space-y-2">
+                                <Label htmlFor="lastName">Last Name</Label>
                                 <Input
-                                    id="firstName"
-                                    value={firstName}
-                                    onChange={(e) => setFirstName(e.target.value)}
-                                    placeholder="e.g. John"
-                                    className="h-12 pl-11 bg-white border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl font-medium"
+                                    id="lastName"
+                                    value={lastName}
+                                    onChange={(e) => setLastName(e.target.value)}
+                                    placeholder="e.g. Doe"
                                     required
                                 />
                             </div>
                         </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                                <Label htmlFor="email">
+                                    Email <span className="text-[#FF3B3B]">*</span>
+                                </Label>
+                                <div className="relative group">
+                                    <Mail className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 group-focus-within:text-[#00FFBB] transition-colors" />
+                                    <Input
+                                        id="email"
+                                        type="email"
+                                        value={email}
+                                        onChange={(e) => setEmail(e.target.value)}
+                                        placeholder="john@example.com"
+                                        className="pl-11"
+                                        required
+                                    />
+                                </div>
+                            </div>
+                            <div className="space-y-2">
+                                <Label htmlFor="phone">Phone (Optional)</Label>
+                                <div className="relative group">
+                                    <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 group-focus-within:text-[#00FFBB] transition-colors" />
+                                    <Input
+                                        id="phone"
+                                        type="tel"
+                                        value={phone}
+                                        onChange={(e) => setPhone(e.target.value)}
+                                        placeholder="021..."
+                                        className="pl-11"
+                                    />
+                                </div>
+                            </div>
+                        </div>
+
                         <div className="space-y-2">
-                            <Label htmlFor="lastName" className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                                Last Name
-                            </Label>
+                            <Label htmlFor="address">Tenant Address (for Notices)</Label>
                             <Input
-                                id="lastName"
-                                value={lastName}
-                                onChange={(e) => setLastName(e.target.value)}
-                                placeholder="e.g. Doe"
-                                className="h-12 bg-white border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl font-medium"
-                                required
+                                id="address"
+                                value={address}
+                                onChange={(e) => setAddress(e.target.value)}
+                                placeholder="Defaults to Property Address"
                             />
                         </div>
-                    </div>
 
-                    <div className="grid grid-cols-2 gap-4">
+                        {/* Payment Frequency */}
                         <div className="space-y-2">
-                            <Label htmlFor="email" className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                                Email <span className="text-red-500">*</span>
-                            </Label>
-                            <div className="relative group">
-                                <Mail className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-emerald-500 transition-colors" />
+                            <Label>Payment Frequency</Label>
+                            <div className="grid grid-cols-3 gap-2">
+                                {(["Weekly", "Fortnightly", "Monthly"] as PaymentFrequency[]).map((freq) => (
+                                    <button
+                                        key={freq}
+                                        type="button"
+                                        onClick={() => setFrequency(freq)}
+                                        className={`h-11 rounded-xl font-bold text-sm transition-all backdrop-blur-sm ${
+                                            frequency === freq
+                                                ? "bg-[#00FFBB]/15 border border-[#00FFBB]/40 text-[#00FFBB] shadow-[0_0_15px_rgba(0,255,187,0.2)]"
+                                                : "bg-white/5 border border-white/10 text-white/70 hover:bg-white/10 hover:border-white/20"
+                                        }`}
+                                    >
+                                        {freq}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                            <div className="space-y-2">
+                                <Label htmlFor="amount">{getRentLabel()}</Label>
                                 <Input
-                                    id="email"
-                                    type="email"
-                                    value={email}
-                                    onChange={(e) => setEmail(e.target.value)}
-                                    placeholder="john@example.com"
-                                    className="h-12 pl-11 bg-white border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl font-medium"
+                                    id="amount"
+                                    type="number"
+                                    value={amount}
+                                    onChange={(e) => setAmount(e.target.value)}
+                                    placeholder="0.00"
+                                    className="font-bold text-lg tabular-nums"
                                     required
                                 />
                             </div>
-                        </div>
-                        <div className="space-y-2">
-                            <Label htmlFor="phone" className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                                Phone (Optional)
-                            </Label>
-                            <div className="relative group">
-                                <Phone className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-emerald-500 transition-colors" />
-                                <Input
-                                    id="phone"
-                                    type="tel"
-                                    value={phone}
-                                    onChange={(e) => setPhone(e.target.value)}
-                                    placeholder="021..."
-                                    className="h-12 pl-11 bg-white border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl font-medium"
-                                />
+                            <div className="space-y-2">
+                                <Label>{frequency === "Monthly" ? "Due Day of Month" : "Due Day"}</Label>
+                                {frequency === "Monthly" ? (
+                                    <Select value={dueDayOfMonth} onValueChange={setDueDayOfMonth}>
+                                        <SelectTrigger>
+                                            <SelectValue placeholder="Select day" />
+                                        </SelectTrigger>
+                                        <SelectContent className="max-h-[200px]">
+                                            {DAYS_OF_MONTH.map(d => (
+                                                <SelectItem key={d} value={d}>
+                                                    {d}{d === "1" ? "st" : d === "2" ? "nd" : d === "3" ? "rd" : "th"}
+                                                </SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                    </Select>
+                                ) : (
+                                    <Select value={dueDay} onValueChange={setDueDay}>
+                                        <SelectTrigger>
+                                            <SelectValue placeholder="Select day" />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            {DAYS_OF_WEEK.map(d => (
+                                                <SelectItem key={d} value={d}>{d}</SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                    </Select>
+                                )}
                             </div>
                         </div>
-                    </div>
 
-                    <div className="space-y-2">
-                        <Label htmlFor="address" className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                            Tenant Address (for Notices)
-                        </Label>
-                        <Input
-                            id="address"
-                            value={address}
-                            onChange={(e) => setAddress(e.target.value)}
-                            placeholder="Defaults to Property Address"
-                            className="h-12 bg-white border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl font-medium text-slate-600"
-                        />
-                    </div>
+                        {/* Lease Start Date (Optional - for reference only) */}
+                        <div className="space-y-2">
+                            <Label htmlFor="leaseStartDate">Lease Start (Optional)</Label>
+                            <div className="relative group">
+                                <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 group-focus-within:text-[#00FFBB] transition-colors" />
+                                <Input
+                                    id="leaseStartDate"
+                                    type="date"
+                                    value={leaseStartDate}
+                                    onChange={(e) => setLeaseStartDate(e.target.value)}
+                                    className="pl-11"
+                                />
+                            </div>
+                            <p className="text-[10px] text-white/40 font-medium">
+                                When did the tenant move in? (for your records only)
+                            </p>
+                        </div>
 
-                    {/* Payment Frequency */}
-                    <div className="space-y-2">
-                        <Label className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                            Payment Frequency
-                        </Label>
-                        <div className="grid grid-cols-3 gap-2">
-                            {(["Weekly", "Fortnightly", "Monthly"] as PaymentFrequency[]).map((freq) => (
+                        {/* Rent Tracking Toggle */}
+                        <div className="space-y-3 p-4 bg-[#00FFBB]/5 rounded-2xl border border-[#00FFBB]/20">
+                            <div className="flex items-center justify-between">
+                                <div className="flex-1">
+                                    <Label className="text-sm font-black text-white mb-0">
+                                        Start tracking rent from today
+                                    </Label>
+                                    <p className="text-[10px] text-white/50 font-medium mt-0.5">
+                                        Recommended for new tenants or those who are paid up
+                                    </p>
+                                </div>
                                 <button
-                                    key={freq}
                                     type="button"
-                                    onClick={() => setFrequency(freq)}
-                                    className={`h-12 rounded-xl font-bold text-sm transition-all ${
-                                        frequency === freq
-                                            ? "bg-nav-black text-white shadow-lg"
-                                            : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                                    onClick={() => setTrackFromToday(!trackFromToday)}
+                                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-[#00FFBB]/50 focus:ring-offset-2 focus:ring-offset-[#0B0E11] ${
+                                        trackFromToday ? 'bg-[#00FFBB]' : 'bg-white/20'
                                     }`}
                                 >
-                                    {freq}
+                                    <span
+                                        className={`inline-block h-4 w-4 transform rounded-full transition-transform ${
+                                            trackFromToday ? 'translate-x-6 bg-[#0B0E11]' : 'translate-x-1 bg-white'
+                                        }`}
+                                    />
                                 </button>
-                            ))}
-                        </div>
-                    </div>
+                            </div>
 
-                    <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                            <Label htmlFor="amount" className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                                {getRentLabel()}
-                            </Label>
-                            <Input
-                                id="amount"
-                                type="number"
-                                value={amount}
-                                onChange={(e) => setAmount(e.target.value)}
-                                placeholder="0.00"
-                                className="h-12 bg-white border-slate-200 rounded-xl font-bold text-lg tabular-nums"
-                                required
-                            />
-                        </div>
-                        <div className="space-y-2">
-                            <Label className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                                {frequency === "Monthly" ? "Due Day of Month" : "Due Day"}
-                            </Label>
-                            {frequency === "Monthly" ? (
-                                <Select value={dueDayOfMonth} onValueChange={setDueDayOfMonth}>
-                                    <SelectTrigger className="h-12 bg-white border-slate-200 rounded-xl font-medium">
-                                        <SelectValue placeholder="Select day" />
-                                    </SelectTrigger>
-                                    <SelectContent className="bg-white border-slate-200 shadow-xl rounded-xl max-h-[200px]">
-                                        {DAYS_OF_MONTH.map(d => (
-                                            <SelectItem key={d} value={d} className="rounded-lg focus:bg-slate-50">
-                                                {d}{d === "1" ? "st" : d === "2" ? "nd" : d === "3" ? "rd" : "th"}
-                                            </SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
-                            ) : (
-                                <Select value={dueDay} onValueChange={setDueDay}>
-                                    <SelectTrigger className="h-12 bg-white border-slate-200 rounded-xl font-medium">
-                                        <SelectValue placeholder="Select day" />
-                                    </SelectTrigger>
-                                    <SelectContent className="bg-white border-slate-200 shadow-xl rounded-xl">
-                                        {DAYS_OF_WEEK.map(d => (
-                                            <SelectItem key={d} value={d} className="rounded-lg focus:bg-slate-50">{d}</SelectItem>
-                                        ))}
-                                    </SelectContent>
-                                </Select>
+                            {/* Conditional Fields: Show if tracking from past date */}
+                            {!trackFromToday && (
+                                <div className="space-y-3 pt-3 border-t border-[#00FFBB]/20">
+                                    {/* Custom Tracking Date */}
+                                    <div className="space-y-2">
+                                        <Label htmlFor="customTrackingDate">
+                                            Track from past date <span className="text-[#FF3B3B]">*</span>
+                                        </Label>
+                                        <div className="relative group">
+                                            <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 group-focus-within:text-[#00FFBB] transition-colors" />
+                                            <Input
+                                                id="customTrackingDate"
+                                                type="date"
+                                                value={customTrackingDate}
+                                                onChange={(e) => setCustomTrackingDate(e.target.value)}
+                                                className="pl-11"
+                                                required={!trackFromToday}
+                                            />
+                                        </div>
+                                        <p className="text-[10px] text-white/40 font-medium">
+                                            When should we start tracking rent?
+                                        </p>
+                                    </div>
+
+                                    {/* Existing Balance */}
+                                    <div className="space-y-2">
+                                        <Label htmlFor="existingBalance">Existing Balance ($)</Label>
+                                        <div className="relative group">
+                                            <span className="absolute left-4 top-1/2 -translate-y-1/2 text-white/40 group-focus-within:text-[#00FFBB] font-medium">$</span>
+                                            <Input
+                                                id="existingBalance"
+                                                type="number"
+                                                min="0"
+                                                step="0.01"
+                                                value={existingBalance}
+                                                onChange={(e) => setExistingBalance(e.target.value)}
+                                                className="pl-11"
+                                                placeholder="0.00"
+                                            />
+                                        </div>
+                                        <p className="text-[10px] text-white/40 font-medium">
+                                            How much rent are they behind? (leave as $0 if paid up)
+                                        </p>
+                                    </div>
+                                </div>
                             )}
                         </div>
                     </div>
 
-                    {/* Lease Start Date (Optional - for reference only) */}
-                    <div className="space-y-2">
-                        <Label htmlFor="leaseStartDate" className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                            Lease Start (Optional)
-                        </Label>
-                        <div className="relative group">
-                            <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-emerald-500 transition-colors" />
-                            <Input
-                                id="leaseStartDate"
-                                type="date"
-                                value={leaseStartDate}
-                                onChange={(e) => setLeaseStartDate(e.target.value)}
-                                className="h-12 pl-11 bg-white border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl font-medium"
-                            />
-                        </div>
-                        <p className="text-[10px] text-slate-400 font-medium">
-                            When did the tenant move in? (for your records only)
-                        </p>
-                    </div>
-
-                    {/* Rent Tracking Toggle */}
-                    <div className="space-y-3 p-4 bg-emerald-50/50 rounded-2xl border border-emerald-200/50">
-                        <div className="flex items-center justify-between">
-                            <div className="flex-1">
-                                <Label className="text-sm font-black text-nav-black">
-                                    Start tracking rent from today
-                                </Label>
-                                <p className="text-[10px] text-slate-500 font-medium mt-0.5">
-                                    Recommended for new tenants or those who are paid up
-                                </p>
-                            </div>
-                            <button
-                                type="button"
-                                onClick={() => setTrackFromToday(!trackFromToday)}
-                                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 ${
-                                    trackFromToday ? 'bg-emerald-600' : 'bg-slate-300'
-                                }`}
-                            >
-                                <span
-                                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                                        trackFromToday ? 'translate-x-6' : 'translate-x-1'
-                                    }`}
-                                />
-                            </button>
-                        </div>
-
-                        {/* Conditional Fields: Show if tracking from past date */}
-                        {!trackFromToday && (
-                            <div className="space-y-3 pt-3 border-t border-emerald-200/50">
-                                {/* Custom Tracking Date */}
-                                <div className="space-y-2">
-                                    <Label htmlFor="customTrackingDate" className="text-[10px] font-black uppercase tracking-widest text-slate-600">
-                                        Track from past date <span className="text-red-500">*</span>
-                                    </Label>
-                                    <div className="relative group">
-                                        <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 group-focus-within:text-emerald-500 transition-colors" />
-                                        <Input
-                                            id="customTrackingDate"
-                                            type="date"
-                                            value={customTrackingDate}
-                                            onChange={(e) => setCustomTrackingDate(e.target.value)}
-                                            className="h-12 pl-11 bg-white border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl font-medium"
-                                            required={!trackFromToday}
-                                        />
-                                    </div>
-                                    <p className="text-[10px] text-slate-500 font-medium">
-                                        When should we start tracking rent?
-                                    </p>
-                                </div>
-
-                                {/* Existing Balance */}
-                                <div className="space-y-2">
-                                    <Label htmlFor="existingBalance" className="text-[10px] font-black uppercase tracking-widest text-slate-600">
-                                        Existing Balance ($)
-                                    </Label>
-                                    <div className="relative group">
-                                        <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-emerald-500 font-medium">$</span>
-                                        <Input
-                                            id="existingBalance"
-                                            type="number"
-                                            min="0"
-                                            step="0.01"
-                                            value={existingBalance}
-                                            onChange={(e) => setExistingBalance(e.target.value)}
-                                            className="h-12 pl-11 bg-white border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl font-medium"
-                                            placeholder="0.00"
-                                        />
-                                    </div>
-                                    <p className="text-[10px] text-slate-500 font-medium">
-                                        How much rent are they behind? (leave as $0 if paid up)
-                                    </p>
-                                </div>
-                            </div>
-                        )}
-                    </div>
-
-                    <div className="pt-4 flex gap-3">
+                    {/* Pinned footer - always visible */}
+                    <div className="pt-4 flex gap-3 flex-shrink-0 border-t border-white/5 mt-4">
                         <Button
                             type="button"
-                            variant="ghost"
+                            variant="brand-secondary"
+                            size="brand"
                             onClick={() => onOpenChange(false)}
-                            className="flex-1 h-12 font-bold text-slate-500 hover:bg-slate-50 rounded-xl"
+                            className="flex-1"
                         >
                             Cancel
                         </Button>
                         <Button
                             type="submit"
                             disabled={loading}
-                            className="flex-1 h-12 bg-safe-green hover:bg-safe-green/90 text-white font-black rounded-xl shadow-lg shadow-safe-green/20 transition-all active:scale-[0.98] disabled:opacity-50"
+                            variant="brand-accent"
+                            className="flex-1 h-12 rounded-xl"
                         >
                             {loading ? (
                                 <>

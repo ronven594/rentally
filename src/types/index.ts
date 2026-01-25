@@ -2,6 +2,21 @@ export type PaymentStatus = "Paid" | "Late" | "Unpaid" | "Pending" | "Partial";
 
 export type PaymentFrequency = "Weekly" | "Fortnightly" | "Monthly";
 
+export interface StrikeNotice {
+    id: string;
+    type: 'STRIKE_1' | 'STRIKE_2' | 'STRIKE_3' | 'REMEDY_NOTICE';
+    sentAt: string; // ISO date string (YYYY-MM-DD)
+    officialServiceDate: string; // ISO date string - when notice was officially served
+}
+
+export interface PaymentHistoryEntry {
+    id: string;
+    amount: number;
+    date: string; // ISO date string (YYYY-MM-DD)
+    method: 'Bank Transfer' | 'Cash' | 'Other';
+    timestamp: string; // ISO timestamp when payment was recorded
+}
+
 export interface Tenant {
     id: string;
     name: string;
@@ -13,6 +28,9 @@ export interface Tenant {
     startDate?: string; // Lease start date (when tenant moved in)
     trackingStartDate?: string; // When we started tracking this tenant in the app (YYYY-MM-DD)
     openingArrears?: number; // Any existing debt when we started tracking (defaults to 0)
+    sentNotices?: StrikeNotice[]; // 90-day rolling strike history
+    remedyNoticeSentAt?: string; // ISO date string (YYYY-MM-DD) - 14-day notice to remedy
+    paymentHistory?: PaymentHistoryEntry[]; // Record of all payments received
     weekly_rent?: number;
     tenant_address?: string;
     region?: "Wellington" | "Auckland" | "Nelson" | "Taranaki" | "Otago" | "Southland" | "Hawke's Bay" | "Canterbury";

@@ -4,9 +4,10 @@ interface StatusBadgeProps {
     status: 'safe' | 'caution' | 'warning' | 'critical' | 'neutral';
     text: string;
     className?: string;
+    breathing?: boolean; // For rank 5 termination eligible state
 }
 
-export function StatusBadge({ status, text, className }: StatusBadgeProps) {
+export function StatusBadge({ status, text, className, breathing = false }: StatusBadgeProps) {
     // Neon-Dark Color Palette
     const variants = {
         // Phase 1: All Good (Neon Mint)
@@ -52,17 +53,20 @@ export function StatusBadge({ status, text, className }: StatusBadgeProps) {
             "flex items-center gap-2 px-3 py-1.5 rounded-full border transition-all duration-300 backdrop-blur-sm",
             variant.container,
             variant.glow,
+            breathing && status === 'critical' && "animate-[status-breathe-red_2s_ease-in-out_infinite]",
             className
         )}>
             <div className="relative flex items-center justify-center w-2.5 h-2.5">
-                {/* Multi-Ring Halo Pulse */}
-                <span className={cn(
-                    "absolute w-full h-full rounded-full",
-                    status === 'critical' && "animate-[status-pulse-red_2s_infinite]",
-                    status === 'warning' && "animate-[status-pulse-gold_2s_infinite]",
-                    status === 'caution' && "animate-[status-pulse-gold_2s_infinite]",
-                    status === 'safe' && "animate-[status-pulse-green_2s_infinite]"
-                )} />
+                {/* Multi-Ring Halo Pulse - Only when NOT breathing */}
+                {!breathing && (
+                    <span className={cn(
+                        "absolute w-full h-full rounded-full",
+                        status === 'critical' && "animate-[status-pulse-red_2s_infinite]",
+                        status === 'warning' && "animate-[status-pulse-gold_2s_infinite]",
+                        status === 'caution' && "animate-[status-pulse-gold_2s_infinite]",
+                        status === 'safe' && "animate-[status-pulse-green_2s_infinite]"
+                    )} />
+                )}
                 {/* Solid Center Dot with inner glow */}
                 <span className={cn(
                     "relative w-2.5 h-2.5 rounded-full",

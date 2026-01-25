@@ -1,15 +1,15 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { format } from "date-fns";
+import { format, parseISO } from "date-fns";
 import {
     Dialog,
     DialogContent,
     DialogHeader,
     DialogTitle,
 } from "@/components/ui/dialog";
-import { Tenant } from "@/types";
-import { CheckCircle2, Sparkles, Calendar, DollarSign } from "lucide-react";
+import { Tenant, PaymentHistoryEntry } from "@/types";
+import { CheckCircle2, Sparkles, Calendar, DollarSign, Trash2, AlertCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { formatFrequencyLabel } from "@/lib/status-engine";
 
@@ -25,6 +25,8 @@ interface SmartPaymentModalProps {
     onOpenChange: (open: boolean) => void;
     tenant: Tenant;
     onConfirmPayment: (amount: number, date: string) => Promise<void>;
+    onVoidPayment?: (paymentId: string) => Promise<void>;
+    totalOutstandingBalance?: number;
     suggestedMatch?: BankMatch | null;
 }
 
@@ -35,6 +37,8 @@ export function SmartPaymentModal({
     onOpenChange,
     tenant,
     onConfirmPayment,
+    onVoidPayment,
+    totalOutstandingBalance,
     suggestedMatch,
 }: SmartPaymentModalProps) {
     // Auto-prefill with expected weekly rent and today's date
@@ -42,6 +46,12 @@ export function SmartPaymentModal({
     const [paymentDate, setPaymentDate] = useState(format(new Date(), "yyyy-MM-dd"));
     const [modalState, setModalState] = useState<ModalState>("input");
     const [useMatch, setUseMatch] = useState(false);
+    const [voidingPaymentId, setVoidingPaymentId] = useState<string | null>(null);
+
+    // Calculate validation states
+    const parsedAmount = parseFloat(amount);
+    const exceedsBalance = totalOutstandingBalance !== undefined && parsedAmount > totalOutstandingBalance;
+    const isAmountValid = !isNaN(parsedAmount) && parsedAmount > 0 && !exceedsBalance;
 
     // Reset state when modal opens
     useEffect(() => {
@@ -50,8 +60,14 @@ export function SmartPaymentModal({
             setPaymentDate(format(new Date(), "yyyy-MM-dd"));
             setModalState("input");
             setUseMatch(false);
+            setVoidingPaymentId(null);
         }
     }, [open, tenant.rentAmount]);
+
+    // Get recent payment history (last 5 payments)
+    const recentPayments = (tenant.paymentHistory || [])
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+        .slice(0, 5);
 
     // Handle clicking the AI suggestion
     const handleUseMatch = () => {
@@ -64,8 +80,7 @@ export function SmartPaymentModal({
 
     // Handle confirmation
     const handleConfirm = async () => {
-        const parsedAmount = parseFloat(amount);
-        if (isNaN(parsedAmount) || parsedAmount <= 0) return;
+        if (!isAmountValid) return;
 
         setModalState("processing");
 
@@ -81,6 +96,22 @@ export function SmartPaymentModal({
             }, 1500);
         } catch {
             setModalState("input");
+        }
+    };
+
+    // Handle voiding a payment
+    const handleVoidPayment = async (paymentId: string) => {
+        if (!onVoidPayment) return;
+
+        setVoidingPaymentId(paymentId);
+
+        try {
+            await onVoidPayment(paymentId);
+            // Success will be handled by parent component refresh
+        } catch (error) {
+            console.error("Failed to void payment:", error);
+        } finally {
+            setVoidingPaymentId(null);
         }
     };
 
@@ -176,16 +207,29 @@ export function SmartPaymentModal({
                                             setAmount(e.target.value);
                                             setUseMatch(false);
                                         }}
-                                        className="w-full bg-[#F4F6F8] border-0 rounded-2xl py-4 pl-12 pr-4 text-2xl font-black tracking-tighter text-nav-black focus:ring-2 focus:ring-nav-black/20 focus:outline-none transition-all"
+                                        className={cn(
+                                            "w-full bg-white border-2 border-gray-200 rounded-2xl py-4 pl-12 pr-4 text-2xl font-black tracking-tighter text-nav-black focus:ring-2 focus:outline-none transition-all",
+                                            exceedsBalance ? "focus:ring-red-500/30 ring-2 ring-red-500/20 border-red-500/20" : "focus:ring-nav-black/20 focus:border-nav-black/30"
+                                        )}
                                         placeholder="0.00"
                                         step="0.01"
                                         min="0"
+                                        max={totalOutstandingBalance}
                                         disabled={modalState === "processing"}
                                     />
                                 </div>
-                                <p className="text-xs text-gray-400 mt-2 pl-1">
-                                    Expected: ${tenant.rentAmount.toFixed(2)} / {formatFrequencyLabel(tenant.frequency)}
-                                </p>
+                                {exceedsBalance && totalOutstandingBalance !== undefined ? (
+                                    <div className="flex items-center gap-1.5 mt-2 pl-1">
+                                        <AlertCircle className="w-3.5 h-3.5 text-red-500" />
+                                        <p className="text-xs text-red-500 font-bold">
+                                            Cannot exceed current balance of ${totalOutstandingBalance.toFixed(2)}
+                                        </p>
+                                    </div>
+                                ) : (
+                                    <p className="text-xs text-gray-400 mt-2 pl-1">
+                                        Expected: ${tenant.rentAmount.toFixed(2)} / {formatFrequencyLabel(tenant.frequency)}
+                                    </p>
+                                )}
                             </div>
 
                             {/* Date Input */}
@@ -202,11 +246,81 @@ export function SmartPaymentModal({
                                             setPaymentDate(e.target.value);
                                             setUseMatch(false);
                                         }}
-                                        className="w-full bg-[#F4F6F8] border-0 rounded-2xl py-4 pl-12 pr-4 text-base font-bold text-nav-black focus:ring-2 focus:ring-nav-black/20 focus:outline-none transition-all"
+                                        className="w-full bg-white border-2 border-gray-200 rounded-2xl py-4 pl-12 pr-4 text-base font-bold text-nav-black focus:ring-2 focus:ring-nav-black/20 focus:border-nav-black/30 focus:outline-none transition-all"
                                         disabled={modalState === "processing"}
                                     />
                                 </div>
                             </div>
+
+                            {/* Recent Payment History */}
+                            {recentPayments.length > 0 && (
+                                <div className="border-t border-gray-200 pt-5">
+                                    <label className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3 block">
+                                        Recent Payments
+                                    </label>
+                                    <div className="max-h-[160px] overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+                                        {recentPayments.map((payment, index) => (
+                                            <div
+                                                key={payment.id}
+                                                className="flex items-center justify-between py-2.5 px-3 bg-white/60 rounded-xl border border-gray-100 transition-all hover:bg-white/80"
+                                            >
+                                                <div className="flex-1 min-w-0">
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-sm font-bold text-nav-black">
+                                                            ${payment.amount.toFixed(2)}
+                                                        </span>
+                                                        <span className="text-xs text-gray-400">•</span>
+                                                        <span className="text-xs text-gray-500 font-medium">
+                                                            {format(parseISO(payment.date), "MMM d, yyyy")}
+                                                        </span>
+                                                    </div>
+                                                    {payment.method && (
+                                                        <p className="text-[10px] text-gray-400 mt-0.5">
+                                                            {payment.method}
+                                                        </p>
+                                                    )}
+                                                </div>
+
+                                                {/* Void button - only show for most recent payment */}
+                                                {index === 0 && onVoidPayment && (
+                                                    <button
+                                                        onClick={() => handleVoidPayment(payment.id)}
+                                                        disabled={voidingPaymentId === payment.id || modalState === "processing"}
+                                                        className="ml-3 p-2 rounded-lg text-gray-400 hover:text-red-500 hover:bg-red-50 transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
+                                                        title="Void this payment"
+                                                    >
+                                                        {voidingPaymentId === payment.id ? (
+                                                            <span className="w-4 h-4 border-2 border-red-500/30 border-t-red-500 rounded-full animate-spin block" />
+                                                        ) : (
+                                                            <Trash2 className="w-4 h-4" />
+                                                        )}
+                                                    </button>
+                                                )}
+                                            </div>
+                                        ))}
+                                    </div>
+
+                                    {/* Custom scrollbar styles */}
+                                    <style dangerouslySetInnerHTML={{
+                                        __html: `
+                                            .custom-scrollbar::-webkit-scrollbar {
+                                                width: 4px;
+                                            }
+                                            .custom-scrollbar::-webkit-scrollbar-track {
+                                                background: #F1F5F9;
+                                                border-radius: 10px;
+                                            }
+                                            .custom-scrollbar::-webkit-scrollbar-thumb {
+                                                background: #CBD5E1;
+                                                border-radius: 10px;
+                                            }
+                                            .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+                                                background: #94A3B8;
+                                            }
+                                        `
+                                    }} />
+                                </div>
+                            )}
 
                             {/* Action Buttons */}
                             <div className="flex gap-3 pt-2">
@@ -219,7 +333,7 @@ export function SmartPaymentModal({
                                 </button>
                                 <button
                                     onClick={handleConfirm}
-                                    disabled={modalState === "processing" || !amount || parseFloat(amount) <= 0}
+                                    disabled={modalState === "processing" || !isAmountValid}
                                     className={cn(
                                         "flex-1 py-4 text-[11px] font-black uppercase tracking-[0.2em] rounded-full transition-all disabled:opacity-50",
                                         "bg-safe-green text-white shadow-lg shadow-safe-green/20 hover:bg-safe-green/90"

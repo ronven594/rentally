@@ -19,17 +19,20 @@ const buttonVariants = cva(
         ghost:
           "hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent/50",
         link: "text-primary underline-offset-4 hover:underline",
-        // Brand variants - Neon-Dark Theme
+        // Brand variants - Neon-Dark Theme (Glass/Transparent styles)
         brand:
-          "bg-[#0B0E11] text-white font-black uppercase tracking-widest shadow-lg shadow-black/30 hover:bg-black active:scale-95 border border-white/10",
+          "bg-white/5 text-white font-black uppercase tracking-widest border border-white/10 backdrop-blur-sm hover:bg-white/10 hover:border-white/20 hover:shadow-[0_0_15px_rgba(255,255,255,0.1)] active:scale-95 transition-all",
         "brand-success":
-          "bg-[#00FFBB]/10 border border-[#00FFBB]/30 text-[#00FFBB] font-black uppercase tracking-widest hover:bg-[#00FFBB]/20 hover:shadow-[0_0_15px_rgba(0,255,187,0.3)] backdrop-blur-sm",
+          "bg-[#00FFBB]/10 border border-[#00FFBB]/30 text-[#00FFBB] font-black uppercase tracking-widest hover:bg-[#00FFBB]/20 hover:shadow-[0_0_15px_rgba(0,255,187,0.3)] backdrop-blur-sm transition-all",
         "brand-secondary":
-          "bg-white/5 border border-white/10 text-white/70 font-bold uppercase tracking-widest hover:border-white/20 hover:text-white backdrop-blur-sm",
+          "bg-white/5 border border-white/10 text-white/70 font-bold uppercase tracking-widest hover:bg-white/10 hover:border-white/20 hover:text-white backdrop-blur-sm transition-all",
         "brand-danger":
-          "bg-[#FF3B3B] text-white font-black uppercase tracking-widest shadow-[0_0_15px_rgba(255,59,59,0.4)] hover:shadow-[0_0_20px_rgba(255,59,59,0.6)] active:scale-95",
+          "bg-[#FF3B3B]/10 border border-[#FF3B3B]/30 text-[#FF3B3B] font-black uppercase tracking-widest hover:bg-[#FF3B3B]/20 hover:shadow-[0_0_15px_rgba(255,59,59,0.4)] backdrop-blur-sm active:scale-95 transition-all",
         "brand-warning":
-          "bg-[#FFB800] text-[#0B0E11] font-black uppercase tracking-widest shadow-[0_0_12px_rgba(255,184,0,0.3)] hover:shadow-[0_0_18px_rgba(255,184,0,0.5)] active:scale-95",
+          "bg-[#FFB800]/10 border border-[#FFB800]/30 text-[#FFB800] font-black uppercase tracking-widest hover:bg-[#FFB800]/20 hover:shadow-[0_0_15px_rgba(255,184,0,0.4)] backdrop-blur-sm active:scale-95 transition-all",
+        // Accent button for primary actions (Save, Submit, etc.) - Glassmorphism style
+        "brand-accent":
+          "bg-[#00FFBB]/15 border border-[#00FFBB]/40 text-[#00FFBB] font-black uppercase tracking-widest backdrop-blur-sm hover:bg-[#00FFBB]/25 hover:border-[#00FFBB]/60 hover:shadow-[0_0_20px_rgba(0,255,187,0.3)] active:scale-95 transition-all",
       },
       size: {
         default: "h-9 px-4 py-2 has-[>svg]:px-3",

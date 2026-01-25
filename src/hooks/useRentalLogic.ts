@@ -16,7 +16,11 @@ import { analyzeTenancySituation, type StrikeRecord, type AnalysisResult } from 
 import { STRIKE_NOTICE_WORKING_DAYS, TERMINATION_ELIGIBLE_DAYS, NOTICE_REMEDY_PERIOD, TRIBUNAL_FILING_WINDOW_DAYS } from '@/lib/rta-constants';
 import type { RentPayment } from '@/types';
 import type { NZRegion } from '@/lib/nz-holidays';
-import { parseISO, differenceInCalendarDays, addDays, format, isAfter } from 'date-fns';
+import { parseISO, differenceInCalendarDays, addDays, format, isAfter, startOfDay, isBefore, isEqual, addWeeks, addMonths, getDay, nextDay } from 'date-fns';
+import { toZonedTime } from 'date-fns-tz';
+
+// NZ Timezone for consistent date handling
+const NZ_TIMEZONE = "Pacific/Auckland";
 
 // ============================================================================
 // TYPES
@@ -30,6 +34,8 @@ export interface UseRentalLogicInput {
     currentDate?: Date;
     trackingStartDate?: string; // YYYY-MM-DD format - when we started tracking this tenant (defaults to today)
     openingArrears?: number; // Any existing debt when we started tracking (defaults to 0)
+    frequency?: "Weekly" | "Fortnightly" | "Monthly"; // Payment frequency for due date calculation
+    rentDueDay?: string; // e.g. "Wednesday" for weekly/fortnightly, or "1" for monthly (day of month)
 }
 
 // ============================================================================
@@ -178,6 +184,31 @@ export interface RentalLogicResult {
 
     /** Full legal analysis result from legal-engine.ts */
     legalAnalysis: AnalysisResult;
+
+    /**
+     * The calendar date of the FIRST unpaid rent cycle.
+     * CRITICAL: This is an ANCHORED date that does NOT change daily.
+     * Calculated from trackingStartDate + frequency + rentDueDay.
+     * null if no overdue cycles exist (tenant is current).
+     *
+     * Example: If tenant started tracking Dec 31 with Wednesday due days,
+     * and Jan 1 (Wednesday) is unpaid, firstMissedDueDate = "2025-01-01"
+     */
+    firstMissedDueDate: string | null;
+
+    /**
+     * Number of rent cycles missed since firstMissedDueDate.
+     * Calculated as: Math.floor(daysSinceFirstMissed / cycleLength)
+     * - Weekly: cycleLength = 7
+     * - Fortnightly: cycleLength = 14
+     * - Monthly: cycleLength = ~30 (calculated dynamically)
+     *
+     * CRITICAL: If missedCycleCount >= 3, this is a LEGAL EMERGENCY in NZ.
+     * The UI should force the critical state regardless of calendar days.
+     *
+     * 0 if no missed payments, 1+ if cycles are missed.
+     */
+    missedCycleCount: number;
 }
 
 // ============================================================================
@@ -290,6 +321,138 @@ export function createS56Metadata(ledger: Array<{
         total_amount_owed,
         unpaid_amounts,
     };
+}
+
+// ============================================================================
+// FIRST MISSED DUE DATE CALCULATION
+// ============================================================================
+
+/**
+ * Maps day name to date-fns day number (0 = Sunday, 6 = Saturday)
+ */
+const DAY_NAME_TO_NUMBER: Record<string, 0 | 1 | 2 | 3 | 4 | 5 | 6> = {
+    'Sunday': 0,
+    'Monday': 1,
+    'Tuesday': 2,
+    'Wednesday': 3,
+    'Thursday': 4,
+    'Friday': 5,
+    'Saturday': 6,
+};
+
+/**
+ * Calculates the FIRST unpaid due date starting from trackingStartDate.
+ * This date is ANCHORED and does not change daily (unlike subDays(today, daysOverdue)).
+ *
+ * Algorithm:
+ * 1. Start from trackingStartDate
+ * 2. Find the first due date on or after that date (based on rentDueDay + frequency)
+ * 3. Check if that due date is covered by payments
+ * 4. If not covered, that's the first missed date
+ * 5. If covered, advance to next due date and repeat until we find an unpaid one or reach today
+ *
+ * @param trackingStartDate - When we started tracking this tenant (YYYY-MM-DD)
+ * @param frequency - Payment frequency: Weekly, Fortnightly, or Monthly
+ * @param rentDueDay - Day rent is due: "Wednesday" for weekly/fortnightly, or "1"-"28" for monthly
+ * @param payments - All payment records for this tenant
+ * @param currentDate - Today's date (for determining what's "overdue")
+ * @returns ISO date string of first unpaid due date, or null if no overdue payments
+ */
+function calculateFirstMissedDueDate(
+    trackingStartDate: string | undefined,
+    frequency: "Weekly" | "Fortnightly" | "Monthly" | undefined,
+    rentDueDay: string | undefined,
+    payments: Array<{ dueDate: string; amount: number; amountPaid: number; status: string }>,
+    currentDate: Date
+): string | null {
+    // If missing required data, cannot calculate
+    if (!trackingStartDate || !frequency || !rentDueDay) {
+        return null;
+    }
+
+    // Normalize current date to NZ timezone start of day
+    const todayNZ = toZonedTime(currentDate, NZ_TIMEZONE);
+    const today = startOfDay(todayNZ);
+
+    // Parse tracking start date
+    const trackingStart = startOfDay(toZonedTime(parseISO(trackingStartDate), NZ_TIMEZONE));
+
+    // Find the first due date on or after trackingStartDate
+    let currentDueDate: Date;
+
+    if (frequency === 'Monthly') {
+        // For monthly: rentDueDay is the day of month (e.g., "1", "15", "28")
+        const dayOfMonth = parseInt(rentDueDay, 10) || 1;
+
+        // Start with tracking start month
+        currentDueDate = new Date(trackingStart.getFullYear(), trackingStart.getMonth(), dayOfMonth);
+
+        // If that date is before tracking start, move to next month
+        if (isBefore(currentDueDate, trackingStart)) {
+            currentDueDate = addMonths(currentDueDate, 1);
+        }
+    } else {
+        // For Weekly/Fortnightly: rentDueDay is day name (e.g., "Wednesday")
+        const targetDayNum = DAY_NAME_TO_NUMBER[rentDueDay];
+
+        if (targetDayNum === undefined) {
+            console.warn(`Unknown rent due day: ${rentDueDay}, defaulting to Wednesday`);
+            currentDueDate = nextDay(trackingStart, 3); // Default to Wednesday
+        } else {
+            // Find the first occurrence of this day on or after trackingStart
+            const currentDayNum = getDay(trackingStart);
+
+            if (currentDayNum === targetDayNum) {
+                // trackingStart IS the due day
+                currentDueDate = trackingStart;
+            } else {
+                // Find next occurrence
+                currentDueDate = nextDay(trackingStart, targetDayNum);
+            }
+        }
+    }
+
+    // Create a map of due dates to payment status for quick lookup
+    const paymentsByDueDate = new Map<string, { paid: number; owed: number }>();
+    payments.forEach(p => {
+        const dueDateStr = format(startOfDay(toZonedTime(parseISO(p.dueDate), NZ_TIMEZONE)), 'yyyy-MM-dd');
+        const existing = paymentsByDueDate.get(dueDateStr) || { paid: 0, owed: 0 };
+        existing.owed += p.amount;
+        existing.paid += p.amountPaid || 0;
+        paymentsByDueDate.set(dueDateStr, existing);
+    });
+
+    // Iterate through due dates from trackingStart until today
+    // Find the FIRST due date that is not fully paid
+    while (isBefore(currentDueDate, today) || isEqual(currentDueDate, today)) {
+        const dueDateStr = format(currentDueDate, 'yyyy-MM-dd');
+        const payment = paymentsByDueDate.get(dueDateStr);
+
+        // Check if this due date is unpaid or partially paid
+        if (!payment || payment.paid < payment.owed - 0.01) {
+            // This is the first missed due date!
+            // Only return if it's actually overdue (before today)
+            if (isBefore(currentDueDate, today)) {
+                return dueDateStr;
+            }
+        }
+
+        // Advance to next due date
+        switch (frequency) {
+            case 'Weekly':
+                currentDueDate = addWeeks(currentDueDate, 1);
+                break;
+            case 'Fortnightly':
+                currentDueDate = addWeeks(currentDueDate, 2);
+                break;
+            case 'Monthly':
+                currentDueDate = addMonths(currentDueDate, 1);
+                break;
+        }
+    }
+
+    // No unpaid due dates found before today
+    return null;
 }
 
 // ============================================================================
@@ -568,6 +731,48 @@ export function calculateRentalLogic(input: UseRentalLogicInput): RentalLogicRes
         input.currentDate || new Date()
     );
 
+    // Calculate ANCHORED first missed due date (does NOT float with today's date)
+    // This is the actual calendar date of the first unpaid rent cycle
+    const firstMissedDueDate = calculateFirstMissedDueDate(
+        input.trackingStartDate,
+        input.frequency,
+        input.rentDueDay,
+        ledger,
+        input.currentDate || new Date()
+    );
+
+    // Calculate missed cycle count (number of rent cycles missed)
+    // CRITICAL: If missedCycleCount >= 3, this is a LEGAL EMERGENCY in NZ
+    let missedCycleCount = 0;
+    if (firstMissedDueDate && input.frequency) {
+        const currentDate = input.currentDate || new Date();
+        const todayNZ = toZonedTime(currentDate, NZ_TIMEZONE);
+        const today = startOfDay(todayNZ);
+        const firstMissed = startOfDay(toZonedTime(parseISO(firstMissedDueDate), NZ_TIMEZONE));
+        const daysSinceFirstMissed = differenceInCalendarDays(today, firstMissed);
+
+        // Calculate cycle length based on frequency
+        let cycleLength: number;
+        switch (input.frequency) {
+            case 'Weekly':
+                cycleLength = 7;
+                break;
+            case 'Fortnightly':
+                cycleLength = 14;
+                break;
+            case 'Monthly':
+                // Approximate monthly as 30 days for cycle counting
+                cycleLength = 30;
+                break;
+            default:
+                cycleLength = 7;
+        }
+
+        // Calculate how many complete cycles have been missed
+        // +1 because the first missed date itself counts as 1 cycle
+        missedCycleCount = Math.floor(daysSinceFirstMissed / cycleLength) + 1;
+    }
+
     return {
         status,
         daysOverdue: legalAnalysis.analysis.daysArrears,
@@ -583,6 +788,8 @@ export function calculateRentalLogic(input: UseRentalLogicInput): RentalLogicRes
         isEligibleSection55_1aa,
         tribunalDeadlineDays, // Days remaining in 28-day filing window (null if N/A, 0 if expired)
         legalAnalysis,
+        firstMissedDueDate, // ANCHORED date - does not float daily
+        missedCycleCount, // Number of rent cycles missed (CRITICAL if >= 3)
     };
 }
 

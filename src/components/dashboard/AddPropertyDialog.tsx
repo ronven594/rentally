@@ -13,7 +13,7 @@ import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Property } from "@/types"
-import { Loader2 } from "lucide-react"
+import { Loader2, Building2 } from "lucide-react"
 import { supabase } from "@/lib/supabaseClient"
 import { toast } from "sonner"
 import { NZRegion } from "@/lib/nz-holidays"
@@ -40,7 +40,7 @@ export function AddPropertyDialog({ open, onOpenChange, onAdd }: AddPropertyDial
     const [name, setName] = useState("");
     const [address, setAddress] = useState("");
     const [region, setRegion] = useState<NZRegion>("Auckland");
-    const [type, setType] = useState("Apartment");
+    const [type, setType] = useState("House");
     const [yearBuilt, setYearBuilt] = useState("");
     const [loading, setLoading] = useState(false);
 
@@ -78,7 +78,7 @@ export function AddPropertyDialog({ open, onOpenChange, onAdd }: AddPropertyDial
                 setName("");
                 setAddress("");
                 setRegion("Auckland");
-                setType("Apartment");
+                setType("House");
                 setYearBuilt("");
                 onOpenChange(false);
             }
@@ -92,76 +92,81 @@ export function AddPropertyDialog({ open, onOpenChange, onAdd }: AddPropertyDial
 
     return (
         <Dialog open={open} onOpenChange={onOpenChange}>
-            <DialogContent className="sm:max-w-md bg-white border-0 shadow-lg rounded-3xl p-6">
+            <DialogContent className="sm:max-w-md">
                 <DialogHeader className="mb-4">
-                    <DialogTitle className="text-xl font-black italic text-nav-black tracking-tight">Add New Property</DialogTitle>
+                    <div className="flex items-center gap-3">
+                        <div className="w-10 h-10 bg-[#00FFBB]/10 rounded-xl flex items-center justify-center">
+                            <Building2 className="w-5 h-5 text-[#00FFBB]" />
+                        </div>
+                        <DialogTitle>Add New Property</DialogTitle>
+                    </div>
                 </DialogHeader>
-                <form onSubmit={handleSubmit} className="space-y-6">
-                    <div className="space-y-2">
-                        <Label htmlFor="prop-name" className="text-sm font-semibold text-slate-700">Property Name</Label>
+                <form onSubmit={handleSubmit} className="space-y-5">
+                    <div className="space-y-1">
+                        <Label htmlFor="prop-name">Property Name</Label>
                         <Input
                             id="prop-name"
                             placeholder="e.g. 91 Boundary St"
                             value={name}
                             onChange={(e) => setName(e.target.value)}
-                            className="h-12 border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl px-4"
                             required
                         />
                     </div>
 
-                    <div className="space-y-2">
-                        <Label htmlFor="prop-address" className="text-sm font-semibold text-slate-700">Address</Label>
+                    <div className="space-y-1">
+                        <Label htmlFor="prop-address">Address</Label>
                         <Input
                             id="prop-address"
                             placeholder="e.g. 123 Queen Street, Auckland"
                             value={address}
                             onChange={(e) => setAddress(e.target.value)}
-                            className="h-12 border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl px-4"
                             required
                         />
                     </div>
 
                     <div className="grid grid-cols-2 gap-4">
-                        <div className="space-y-2">
-                            <Label htmlFor="prop-region" className="text-sm font-semibold text-slate-700">
-                                Region <span className="text-red-500">*</span>
+                        <div className="space-y-1">
+                            <Label htmlFor="prop-region">
+                                Region <span className="text-[#FF3B3B]">*</span>
                             </Label>
                             <Select value={region} onValueChange={(v: NZRegion) => setRegion(v)}>
-                                <SelectTrigger id="prop-region" className="h-12 border-slate-200 rounded-xl focus:ring-emerald-500">
+                                <SelectTrigger id="prop-region">
                                     <SelectValue placeholder="Select region" />
                                 </SelectTrigger>
-                                <SelectContent className="bg-white border-slate-200">
+                                <SelectContent>
                                     {NZ_REGIONS.map(r => (
                                         <SelectItem key={r} value={r}>{r}</SelectItem>
                                     ))}
                                 </SelectContent>
                             </Select>
                         </div>
-                        <div className="space-y-2">
-                            <Label htmlFor="prop-type" className="text-sm font-semibold text-slate-700">Type</Label>
+                        <div className="space-y-1">
+                            <Label htmlFor="prop-type">Type</Label>
                             <Input
                                 id="prop-type"
                                 placeholder="e.g. Apartment, House"
                                 value={type}
                                 onChange={(e) => setType(e.target.value)}
-                                className="h-12 border-slate-200 focus:border-emerald-500 focus:ring-emerald-500 rounded-xl px-4"
                             />
                         </div>
                     </div>
 
-                    <DialogFooter className="pt-2">
+                    <DialogFooter className="pt-4 gap-2">
                         <Button
                             type="button"
-                            variant="ghost"
+                            variant="brand-secondary"
+                            size="brand"
                             onClick={() => onOpenChange(false)}
-                            className="h-12 px-6 font-semibold"
+                            className="rounded-xl"
                         >
                             Cancel
                         </Button>
                         <Button
                             type="submit"
                             disabled={loading}
-                            className="h-12 px-8 bg-safe-green hover:bg-safe-green/90 text-white font-black rounded-xl transition-all shadow-lg shadow-safe-green/20 active:scale-95 disabled:opacity-50"
+                            variant="brand-accent"
+                            size="brand"
+                            className="rounded-xl"
                         >
                             {loading ? (
                                 <>

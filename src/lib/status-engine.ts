@@ -174,12 +174,12 @@ export function getPropertyStatus(tenantStatuses: TenantStatus[]): {
  * RTA Severity Levels (for visual consistency across PropertyCard, TenantCard, StatusBadge)
  */
 /**
- * Kiwi-friendly Status Helper with 4-Phase Visual Escalation
+ * 4-Tier Universal Status System
  *
- * Phase 1: "All Good" (Green) - No arrears
- * Phase 2: "Caution" (Glowing Amber Border) - 1 calendar day to 4 working days overdue
- * Phase 3: "Strike Warning" (Solid Amber) - 5+ working days OR 1-2 active strikes
- * Phase 4: "Termination Eligible" (Solid Red) - 3 strikes OR 21+ calendar days
+ * TIER 0: OK/PAID (Green) - No arrears, all paid
+ * TIER 1: OVERDUE (Amber Outline Glow) - 1-4 working days, no strike eligible yet
+ * TIER 2: STRIKE ELIGIBLE (Solid Gold) - 5+ working days OR Strike 1 active
+ * TIER 3: TERMINATION (Electric Red) - Strike 2+ OR termination risk
  */
 export interface KiwiStatus {
     label: string;
@@ -194,44 +194,44 @@ export function getKiwiStatus(
     totalArrears: number,
     activeStrikeCount: number = 0
 ): KiwiStatus {
-    // PHASE 4: TERMINATION ELIGIBLE (Solid Red)
-    // Trigger: 3 active strikes OR 21+ calendar days overdue
-    if (activeStrikeCount >= 3 || daysArrears >= 21) {
+    // TIER 3: TERMINATION (Electric Red #FF3B3B)
+    // Trigger: Strike 2+ issued
+    if (activeStrikeCount >= 2) {
         return {
-            label: "Termination Eligible",
-            color: "#DC2626", // Red-600
+            label: "Termination",
+            color: "#FF3B3B", // Electric Red
             severity: 'critical',
             actionText: "Termination Eligible"
         };
     }
 
-    // PHASE 3: STRIKE WARNING (Solid Amber)
-    // Trigger: 5+ working days overdue OR 1-2 active strikes
-    if (workingDaysOverdue >= 5 || (activeStrikeCount >= 1 && activeStrikeCount <= 2)) {
+    // TIER 2: STRIKE ELIGIBLE (Solid Gold #FBBF24)
+    // Trigger: 5+ working days overdue OR Strike 1 active
+    if (workingDaysOverdue >= 5 || activeStrikeCount === 1) {
         return {
-            label: "Strike Warning",
-            color: "#F59E0B", // Amber-500
+            label: "Strike Eligible",
+            color: "#FBBF24", // Solid Gold
             severity: 'warning',
-            actionText: activeStrikeCount > 0 ? `${activeStrikeCount} Strike${activeStrikeCount > 1 ? 's' : ''} Active` : "Strike Notice Ready"
+            actionText: activeStrikeCount === 1 ? "Strike 1 Active" : "Strike Notice Ready"
         };
     }
 
-    // PHASE 2: CAUTION (Glowing Amber Border)
-    // Trigger: 1 calendar day overdue but less than 5 working days
-    if (totalArrears > 0 && daysArrears >= 1 && workingDaysOverdue < 5) {
+    // TIER 1: OVERDUE (Amber Outline #D97706)
+    // Trigger: 1-4 working days overdue, no strike eligible yet
+    if (totalArrears > 0 && workingDaysOverdue >= 1 && workingDaysOverdue < 5) {
         return {
-            label: "Caution",
-            color: "#F59E0B", // Amber-500 (same as warning, but different styling)
+            label: "Overdue",
+            color: "#D97706", // Muted Amber
             severity: 'caution',
             actionText: "Payment Pending"
         };
     }
 
-    // PHASE 1: ALL GOOD (Green)
-    // Trigger: No arrears
+    // TIER 0: OK/PAID (Green #00FFBB)
+    // Trigger: No arrears, all paid
     return {
         label: "All Good",
-        color: "#008060", // Green-700
+        color: "#00FFBB", // Neon Green
         severity: 'safe',
         actionText: "Up to Date"
     };
@@ -256,7 +256,7 @@ export function getRTASeverity(daysOverdue: number, workingDaysOverdue: number, 
 
 /**
  * Get smart obligation message for the dashboard banner
- * CRITICAL: daysLate parameter represents WORKING DAYS (not calendar days)
+ * CRITICAL: Now uses activeStrikeCount as primary severity indicator
  */
 export interface ObligationMessage {
     type: 'action' | 'reconcile' | 'monitor' | 'none';
@@ -265,41 +265,49 @@ export interface ObligationMessage {
     propertyAddress: string;
     daysLate: number; // Working days overdue (or calendar days for Monitor phase)
     calendarDays?: number; // Calendar days overdue (for Monitor phase display)
+    activeStrikeCount: number; // Number of active strikes (0-3)
     urgency: 'critical' | 'high' | 'monitor' | 'none';
 }
 
 export function getObligationMessages(
-    tenants: Array<{ name: string; propertyAddress: string; daysLate: number; calendarDays?: number }>
+    tenants: Array<{ name: string; propertyAddress: string; daysLate: number; calendarDays?: number; activeStrikeCount: number }>
 ): ObligationMessage[] {
     const messages: ObligationMessage[] = [];
 
-    // Sort by urgency (most working days late first)
-    const sorted = [...tenants].sort((a, b) => b.daysLate - a.daysLate);
+    // Sort by urgency (strike count first, then days late)
+    const sorted = [...tenants].sort((a, b) => {
+        if (b.activeStrikeCount !== a.activeStrikeCount) {
+            return b.activeStrikeCount - a.activeStrikeCount;
+        }
+        return b.daysLate - a.daysLate;
+    });
 
     for (const tenant of sorted) {
-        // 10+ working days: Strike 2/3 territory
-        if (tenant.daysLate >= 10) {
+        // STATE 3: Strike 2+ (Critical - Near Termination)
+        if (tenant.activeStrikeCount >= 2) {
             messages.push({
                 type: 'action',
-                message: `ACTION REQUIRED: SECTION 55 STRIKE NOTICE READY`,
+                message: `STRIKE ${tenant.activeStrikeCount} ACTIVE: TERMINATION APPLICATION READY`,
                 tenantName: tenant.name,
                 propertyAddress: tenant.propertyAddress,
                 daysLate: tenant.daysLate,
                 calendarDays: tenant.calendarDays,
+                activeStrikeCount: tenant.activeStrikeCount,
                 urgency: 'critical',
             });
-            // 5-9 working days: Strike 1 territory
-        } else if (tenant.daysLate >= 5) {
+        // STATE 2: Strike 1 (Warning)
+        } else if (tenant.activeStrikeCount === 1) {
             messages.push({
                 type: 'reconcile',
-                message: `RECONCILE: ${tenant.name.toUpperCase()} IS ${tenant.daysLate} WORKING DAYS BEHIND`,
+                message: `STRIKE 1 ACTIVE: ${tenant.name.toUpperCase()} ESCALATING`,
                 tenantName: tenant.name,
                 propertyAddress: tenant.propertyAddress,
                 daysLate: tenant.daysLate,
                 calendarDays: tenant.calendarDays,
+                activeStrikeCount: tenant.activeStrikeCount,
                 urgency: 'high',
             });
-            // 1-4 working days: Monitor phase
+        // STATE 1: Payment Pending (No Strikes)
         } else if (tenant.daysLate >= 1 || (tenant.calendarDays && tenant.calendarDays >= 1)) {
             const displayDays = tenant.calendarDays || tenant.daysLate;
             messages.push({
@@ -309,6 +317,7 @@ export function getObligationMessages(
                 propertyAddress: tenant.propertyAddress,
                 daysLate: tenant.daysLate,
                 calendarDays: tenant.calendarDays,
+                activeStrikeCount: tenant.activeStrikeCount,
                 urgency: 'monitor',
             });
         }
