@@ -34,16 +34,18 @@ export function ConfirmationDialog({
         <AlertDialog open={open} onOpenChange={onOpenChange}>
             <AlertDialogContent className="bg-white rounded-2xl shadow-lg border-none">
                 <AlertDialogHeader>
-                    <AlertDialogTitle className="text-slate-900">{title}</AlertDialogTitle>
+                    <AlertDialogTitle className="font-black text-nav-black">{title}</AlertDialogTitle>
                     <AlertDialogDescription className="text-slate-500">
                         {description}
                     </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
-                    <AlertDialogCancel className="rounded-xl border-none hover:bg-slate-100">Cancel</AlertDialogCancel>
+                    <AlertDialogCancel className="rounded-xl border-none hover:bg-slate-100 text-nav-black font-bold">Cancel</AlertDialogCancel>
                     <AlertDialogAction
                         onClick={onConfirm}
-                        className={variant === "destructive" ? "bg-rose-500 hover:bg-rose-600 rounded-xl" : "bg-emerald-500 hover:bg-emerald-600 rounded-xl"}
+                        className={variant === "destructive"
+                            ? "bg-overdue-red hover:bg-overdue-red/90 text-white rounded-xl font-black shadow-lg"
+                            : "bg-safe-green hover:bg-safe-green/90 text-white rounded-xl font-black shadow-lg"}
                     >
                         {confirmText}
                     </AlertDialogAction>

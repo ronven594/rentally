@@ -5,115 +5,245 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-  /* ... existing vars ... */
-  --shadow-neu: var(--shadow-neu);
-  --shadow-neu-pressed: var(--shadow-neu-pressed);
-  --color-neu-base: var(--neu-base);
+
+  /* Neon-Dark Palette */
+  --color-neon-mint: #00FFBB;
+  --color-electric-gold: #FFB800;
+  --color-electric-red: #FF3B3B;
+  --color-dark-bg: #0B0E11;
+  --color-glass-white: rgba(255, 255, 255, 0.05);
+  --color-glass-border: rgba(255, 255, 255, 0.1);
+
+  /* Legacy colors (mapped to new palette) */
+  --color-overdue-red: #FF3B3B;
+  --color-overdue-bg: rgba(255, 59, 59, 0.1);
+  --color-safe-green: #00FFBB;
+  --color-safe-bg: rgba(0, 255, 187, 0.1);
+  --color-nav-black: #0B0E11;
+
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-mono: 'Geist Mono', 'JetBrains Mono', monospace;
+
+  --shadow-glow-red: 0 0 20px rgba(255, 59, 59, 0.5);
+  --shadow-glow-green: 0 0 20px rgba(0, 255, 187, 0.5);
+  --shadow-glow-gold: 0 0 20px rgba(255, 184, 0, 0.5);
+  --shadow-glow-blue: 0 20px 40px -15px rgba(59, 130, 246, 0.1);
 }
 
 :root {
-  /* Robinhood-inspired Calm Palette */
-  --background: #ffffff;
-  --foreground: #1c1c1c;
-
-  --card: #ffffff;
-  --card-foreground: #1c1c1c;
-
-  --popover: #ffffff;
-  --popover-foreground: #1c1c1c;
-
-  --primary: #00c805;
-  /* Robinhood Green - used sparingly for secondary actions or status */
-  --primary-foreground: #ffffff;
-
-  --secondary: #f5f5f5;
-  --secondary-foreground: #1c1c1c;
-
-  --muted: #f9f9f9;
-  --muted-foreground: #8c8c8c;
-
-  --accent: #f5f5f5;
-  --accent-foreground: #1c1c1c;
-
-  --destructive: #ff5a5f;
-  --destructive-foreground: #ffffff;
-
-  --border: #f0f0f0;
-  --input: #ffffff;
-  --ring: #00c805;
-
-  --radius: 1rem;
-
-  /* Soft shadows instead of heavy neumorphism */
-  --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
-  --shadow-md: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
-  --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
-}
-
-.dark {
-  --background: #1c1c1c;
-  --foreground: #ffffff;
-
-  --card: #262626;
-  --card-foreground: #ffffff;
-
-  --popover: #262626;
-  --popover-foreground: #ffffff;
-
-  --primary: #00c805;
-  --primary-foreground: #1c1c1c;
-
-  --secondary: #333333;
-  --secondary-foreground: #ffffff;
-
-  --muted: #333333;
-  --muted-foreground: #a6a6a6;
-
-  --accent: #333333;
-  --accent-foreground: #ffffff;
-
-  --destructive: #ff5a5f;
-  --destructive-foreground: #ffffff;
-
-  --border: #333333;
-  --input: #262626;
-  --ring: #00c805;
+  --background: #0B0E11;
+  --foreground: #FFFFFF;
 }
 
 @layer base {
-  * {
-    border-color: var(--border);
-    outline-color: color-mix(in srgb, var(--ring), transparent 50%);
-  }
-
   body {
-    background-color: #f7f9fa;
-    /* Very light cool gray background to make white cards pop */
+    background-color: var(--background);
     color: var(--foreground);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
   }
 }
 
-@utility shadow-neu {
-  box-shadow: var(--shadow-neu);
+/* Neon-Dark Multi-Ring Halo Pulse Animations */
+@keyframes status-pulse-red {
+  0% {
+    box-shadow:
+      0 0 0 0 rgba(255, 59, 59, 0.6),
+      0 0 0 0 rgba(255, 59, 59, 0.3),
+      0 0 20px rgba(255, 59, 59, 0.4);
+    transform: translateZ(0);
+  }
+  50% {
+    box-shadow:
+      0 0 0 8px rgba(255, 59, 59, 0.2),
+      0 0 0 16px rgba(255, 59, 59, 0.1),
+      0 0 30px rgba(255, 59, 59, 0.6);
+    transform: translateZ(0);
+  }
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(255, 59, 59, 0),
+      0 0 0 0 rgba(255, 59, 59, 0),
+      0 0 20px rgba(255, 59, 59, 0.4);
+    transform: translateZ(0);
+  }
 }
 
-@utility shadow-neu-pressed {
-  box-shadow: var(--shadow-neu-pressed);
+@keyframes status-pulse-green {
+  0% {
+    box-shadow:
+      0 0 0 0 rgba(0, 255, 187, 0.6),
+      0 0 0 0 rgba(0, 255, 187, 0.3),
+      0 0 15px rgba(0, 255, 187, 0.4);
+    transform: translateZ(0);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px rgba(0, 255, 187, 0.2),
+      0 0 0 12px rgba(0, 255, 187, 0.1),
+      0 0 25px rgba(0, 255, 187, 0.5);
+    transform: translateZ(0);
+  }
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(0, 255, 187, 0),
+      0 0 0 0 rgba(0, 255, 187, 0),
+      0 0 15px rgba(0, 255, 187, 0.4);
+    transform: translateZ(0);
+  }
 }
 
-/* Intensified Fintech Glows */
-@utility shadow-glow-emerald {
-  box-shadow: 0 0 12px 2px rgba(0, 200, 5, 0.25);
+@keyframes status-pulse-gold {
+  0% {
+    box-shadow:
+      0 0 0 0 rgba(255, 184, 0, 0.6),
+      0 0 0 0 rgba(255, 184, 0, 0.3),
+      0 0 15px rgba(255, 184, 0, 0.4);
+    transform: translateZ(0);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px rgba(255, 184, 0, 0.2),
+      0 0 0 12px rgba(255, 184, 0, 0.1),
+      0 0 25px rgba(255, 184, 0, 0.5);
+    transform: translateZ(0);
+  }
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(255, 184, 0, 0),
+      0 0 0 0 rgba(255, 184, 0, 0),
+      0 0 15px rgba(255, 184, 0, 0.4);
+    transform: translateZ(0);
+  }
 }
 
-@utility shadow-glow-amber {
-  box-shadow: 0 0 12px 2px rgba(245, 158, 11, 0.25);
+/* Legacy amber - alias to gold */
+@keyframes status-pulse-amber {
+  0% {
+    box-shadow:
+      0 0 0 0 rgba(255, 184, 0, 0.6),
+      0 0 0 0 rgba(255, 184, 0, 0.3),
+      0 0 15px rgba(255, 184, 0, 0.4);
+    transform: translateZ(0);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px rgba(255, 184, 0, 0.2),
+      0 0 0 12px rgba(255, 184, 0, 0.1),
+      0 0 25px rgba(255, 184, 0, 0.5);
+    transform: translateZ(0);
+  }
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(255, 184, 0, 0),
+      0 0 0 0 rgba(255, 184, 0, 0),
+      0 0 15px rgba(255, 184, 0, 0.4);
+    transform: translateZ(0);
+  }
 }
 
-@utility shadow-glow-rose {
-  box-shadow: 0 0 15px 3px rgba(244, 63, 94, 0.3);
+@keyframes status-pulse-black {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.3);
+    transform: translateZ(0);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgba(255, 255, 255, 0.1);
+    transform: translateZ(0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0);
+    transform: translateZ(0);
+  }
+}
+
+@utility pulse-red {
+  animation: status-pulse-red 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@utility pulse-green {
+  animation: status-pulse-green 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@utility pulse-gold {
+  animation: status-pulse-gold 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@utility pulse-amber {
+  animation: status-pulse-amber 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@utility pulse-black {
+  animation: status-pulse-black 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+@utility glow-red {
+  box-shadow: var(--shadow-glow-red);
+}
+
+@utility glow-green {
+  box-shadow: var(--shadow-glow-green);
+}
+
+@utility glow-gold {
+  box-shadow: var(--shadow-glow-gold);
+}
+
+@utility glow-blue {
+  box-shadow: var(--shadow-glow-blue);
+}
+
+@utility strike-active {
+  background-color: #FF3B3B;
+  box-shadow: 0 0 12px rgba(255, 59, 59, 0.5);
+}
+
+@utility btn-black {
+  @apply bg-[#0B0E11] text-white font-black uppercase tracking-widest hover:bg-black transition-all active:scale-95 border border-white/10;
+}
+
+/* Glass Component Styling - Neon Dark */
+@utility glass-card {
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+@utility card-base {
+  @apply glass-card rounded-[2rem] p-6 transition-all duration-300;
+}
+
+/* Neon Text Colors */
+@utility text-neon-mint {
+  color: #00FFBB;
+}
+
+@utility text-electric-gold {
+  color: #FFB800;
+}
+
+@utility text-electric-red {
+  color: #FF3B3B;
+}
+
+/* Neon Background Colors */
+@utility bg-neon-mint {
+  background-color: #00FFBB;
+}
+
+@utility bg-electric-gold {
+  background-color: #FFB800;
+}
+
+@utility bg-electric-red {
+  background-color: #FF3B3B;
+}
+
+/* Monospace font for metrics */
+@utility font-mono-metric {
+  font-family: 'Geist Mono', 'JetBrains Mono', monospace;
+  font-variant-numeric: tabular-nums;
 }

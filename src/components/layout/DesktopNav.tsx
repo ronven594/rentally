@@ -30,14 +30,14 @@ export function DesktopNav() {
     }
 
     return (
-        <aside className="hidden md:flex flex-col w-64 fixed inset-y-0 left-0 bg-white border-r border-slate-50 z-20">
+        <aside className="hidden md:flex flex-col w-64 fixed inset-y-0 left-0 bg-[#0B0E11] border-r border-white/10 z-20">
             <div className="flex flex-col h-full px-4 py-8">
                 {/* Brand */}
                 <div className="flex items-center gap-3 px-4 mb-10">
-                    <div className="w-8 h-8 bg-emerald-600 rounded-lg flex items-center justify-center shadow-lg shadow-emerald-100">
-                        <Building2 className="w-5 h-5 text-white" />
+                    <div className="w-8 h-8 bg-[#00FFBB] rounded-lg flex items-center justify-center shadow-[0_0_15px_rgba(0,255,187,0.3)]">
+                        <Building2 className="w-5 h-5 text-[#0B0E11]" />
                     </div>
-                    <span className="text-sm font-black text-slate-900 tracking-tighter uppercase">
+                    <span className="text-sm font-black text-white tracking-tighter uppercase">
                         NZ Landlord
                     </span>
                 </div>
@@ -55,8 +55,8 @@ export function DesktopNav() {
                                 className={cn(
                                     "flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold transition-all duration-200",
                                     isActive
-                                        ? "bg-slate-900 text-white shadow-lg shadow-slate-200"
-                                        : "text-slate-500 hover:bg-slate-50 hover:text-slate-900"
+                                        ? "bg-white/10 text-[#00FFBB] shadow-[0_0_12px_rgba(0,255,187,0.15)]"
+                                        : "text-white/50 hover:bg-white/5 hover:text-white"
                                 )}
                             >
                                 <Icon className={cn("w-5 h-5", isActive ? "stroke-[2.5px]" : "stroke-2")} />
@@ -69,25 +69,25 @@ export function DesktopNav() {
                 {/* Footer / Profile */}
                 <div className="mt-auto space-y-4">
                     {user && (
-                        <div className="px-4 py-3 bg-slate-50 rounded-2xl border border-slate-100">
-                            <p className="text-[10px] font-black uppercase text-slate-400 tracking-widest leading-none mb-1">Authenticated as</p>
-                            <p className="text-sm font-bold text-slate-900 truncate">{profile?.full_name || 'Landlord'}</p>
-                            <p className="text-[10px] text-slate-500 truncate">{user.email}</p>
+                        <div className="px-4 py-3 bg-white/5 rounded-2xl border border-white/10">
+                            <p className="text-[10px] font-black uppercase text-white/40 tracking-widest leading-none mb-1">Authenticated as</p>
+                            <p className="text-sm font-bold text-white truncate">{profile?.full_name || 'Landlord'}</p>
+                            <p className="text-[10px] text-white/50 truncate">{user.email}</p>
                         </div>
                     )}
 
                     <button
                         onClick={handleSignOut}
-                        className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold text-slate-500 hover:bg-red-50 hover:text-red-600 transition-all duration-200"
+                        className="w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-bold text-white/50 hover:bg-[#FF3B3B]/10 hover:text-[#FF3B3B] transition-all duration-200"
                     >
                         <LogOut className="w-5 h-5" />
                         Sign Out
                     </button>
 
                     <div className="px-4">
-                        <div className="flex items-center gap-2 pt-2 border-t border-slate-100">
-                            <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-glow-emerald" />
-                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-tight">RTA v2026 Ready</span>
+                        <div className="flex items-center gap-2 pt-2 border-t border-white/10">
+                            <div className="w-2 h-2 rounded-full bg-[#00FFBB] shadow-[0_0_8px_rgba(0,255,187,0.5)]" />
+                            <span className="text-[10px] font-bold text-white/40 uppercase tracking-tight">RTA v2026 Ready</span>
                         </div>
                     </div>
                 </div>

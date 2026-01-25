@@ -54,7 +54,7 @@ export function RecordPaymentDialog({
         <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent className="sm:max-w-md bg-white">
                 <DialogHeader>
-                    <DialogTitle>Record Payment - {tenant.name}</DialogTitle>
+                    <DialogTitle className="font-black italic text-nav-black">Record Payment - {tenant.name}</DialogTitle>
                 </DialogHeader>
 
                 <div className="space-y-4 py-4">
@@ -123,7 +123,7 @@ export function RecordPaymentDialog({
                         type="button"
                         onClick={handleSubmit}
                         disabled={isProcessing}
-                        className="bg-slate-900 hover:bg-black text-white"
+                        className="bg-safe-green hover:bg-safe-green/90 text-white font-black"
                     >
                         {isProcessing ? 'Recording...' : 'Record Payment'}
                     </Button>

@@ -11,7 +11,8 @@
  * - Section 56: 14-Day Notice to Remedy
  */
 
-import { format, addDays, differenceInCalendarDays, getDay, parseISO, isAfter, isBefore, isEqual } from "date-fns";
+import { format, addDays, differenceInCalendarDays, getDay, parseISO, isAfter, isBefore, isEqual, startOfDay } from "date-fns";
+import { toZonedTime } from "date-fns-tz";
 import { type NZRegion, isNZHoliday } from "@/lib/nz-holidays";
 
 // ============================================================================
@@ -21,6 +22,24 @@ import { type NZRegion, isNZHoliday } from "@/lib/nz-holidays";
 export type NoticeType = "S55_STRIKE" | "S55A_SOCIAL" | "S56_REMEDY" | "S55_21DAYS";
 export type AnalysisStatus = "ACTION_REQUIRED" | "COMPLIANT" | "TRIBUNAL_ELIGIBLE";
 
+/**
+ * Metadata structure for S56_REMEDY notices (stored in notices.metadata JSONB)
+ *
+ * CRITICAL: A 14-Day Notice to Remedy is DEBT-SPECIFIC.
+ * If the specific debt mentioned in the notice is paid, the notice is "spent"
+ * even if new debt has appeared since.
+ */
+export interface S56NoticeMetadata {
+    /** Snapshot of ledger entry IDs that were unpaid when notice was issued */
+    ledger_entry_ids: string[];
+    /** Snapshot of due dates that were unpaid when notice was issued */
+    due_dates: string[];
+    /** Total amount owed at time of notice issuance */
+    total_amount_owed: number;
+    /** Individual unpaid amounts by due date for detailed tracking */
+    unpaid_amounts: Record<string, number>;
+}
+
 export interface StrikeRecord {
     noticeId: string;
     sentDate: string;           // ISO timestamp when email was sent
@@ -28,6 +47,12 @@ export interface StrikeRecord {
     type: NoticeType;
     rentDueDate?: string;       // For rent strikes
     amountOwed?: number;
+    /**
+     * CRITICAL for S56_REMEDY notices: Contains snapshot of specific debt
+     * This allows checking if the SPECIFIC debt mentioned in the notice was paid,
+     * not just whether there's ANY current debt.
+     */
+    metadata?: S56NoticeMetadata | Record<string, any>;
 }
 
 export interface BehaviorNote {
@@ -55,6 +80,24 @@ export interface AnalysisInput {
     strikeHistory: StrikeRecord[];
     behaviorNotes?: BehaviorNote[];
     currentDate?: Date; // For testing - defaults to now
+    trackingStartDate?: string; // When we started tracking this tenant (YYYY-MM-DD) - defaults to today
+    openingArrears?: number; // Any existing debt when we started tracking (defaults to 0)
+}
+
+/**
+ * TRACKING START DATE LOGIC
+ * This ensures the UI only reflects debt incurred AFTER we started tracking this tenant.
+ * Any debt before the tracking start date should be captured in openingArrears instead.
+ */
+export function getValidLedger(ledger: LedgerEntry[], trackingStartDate: string): LedgerEntry[] {
+    const floorDate = parseISO(trackingStartDate);
+
+    return ledger.filter(entry => {
+        const dueDate = parseISO(entry.dueDate);
+        // Remove any entries that fall before the tracking start date
+        // We keep entries ON the tracking start date, but filter out anything BEFORE
+        return isAfter(dueDate, floorDate) || isEqual(dueDate, floorDate);
+    });
 }
 
 export interface AnalysisResult {
@@ -65,6 +108,7 @@ export interface AnalysisResult {
         isWithin90Days: boolean;
         daysArrears: number;
         workingDaysOverdue: number;
+        totalArrears: number; // CRITICAL: Filtered total from legal engine (excludes ghost arrears)
         firstStrikeOSD?: string;
         windowExpiryDate?: string;
     };
@@ -101,6 +145,14 @@ export function isNZWorkingDay(date: Date, region?: NZRegion): boolean {
         return false;
     }
 
+    // Summer blackout period: Dec 25 - Jan 15 (inclusive) - NOT working days per RTA
+    const month = date.getMonth() + 1; // 1-indexed (1 = January, 12 = December)
+    const day = date.getDate();
+
+    if ((month === 12 && day >= 25) || (month === 1 && day <= 15)) {
+        return false;
+    }
+
     // Check against NZ public holidays
     const dateStr = format(date, "yyyy-MM-dd");
     if (isNZHoliday(dateStr, region)) {
@@ -126,6 +178,103 @@ export function getNextWorkingDay(date: Date, region?: NZRegion): Date {
     }
 
     return current;
+}
+
+/**
+ * Calculates the Official Service Date (OSD) for a notice under RTA Section 136.
+ *
+ * CRITICAL: Uses NZ timezone for the 5 PM cutoff rule.
+ * The RTA Section 136 5 PM rule refers to NZ time, not server time.
+ *
+ * The 5 PM Rule (RTA Section 136):
+ * - If sent on a working day BEFORE 5 PM NZ time: Service Date = sent date
+ * - If sent on a working day AFTER 5 PM NZ time: Service Date = next working day
+ * - If sent on a non-working day (weekend/holiday): Service Date = next working day
+ *
+ * @param sentAt - The timestamp when the notice was sent (Date object, any timezone)
+ * @param region - Optional NZ region for regional holidays
+ * @returns The official service date (Date object, time set to start of day)
+ *
+ * @example
+ * ```typescript
+ * // IMPORTANT: Examples use UTC timestamps, but hour is checked in NZ time
+ *
+ * // Sent Monday at 4 PM NZDT (3 AM UTC) → Service Date = Monday
+ * const osd1 = calculateServiceDate(new Date('2026-01-19T03:00:00Z'), 'Auckland');
+ *
+ * // Sent Monday at 6 PM NZDT (5 AM UTC) → Service Date = Tuesday
+ * const osd2 = calculateServiceDate(new Date('2026-01-19T05:00:00Z'), 'Auckland');
+ *
+ * // Sent Saturday at 2 PM NZDT → Service Date = Monday (next working day)
+ * const osd3 = calculateServiceDate(new Date('2026-01-24T01:00:00Z'), 'Auckland');
+ * ```
+ */
+export function calculateServiceDate(sentAt: Date, region?: NZRegion): Date {
+    // CRITICAL: Convert to NZ timezone before checking the hour
+    // This ensures we check against 5 PM NZ time, not server time
+    const sentDateNZ = toZonedTime(sentAt, NZ_TIMEZONE);
+    const sentHourNZ = sentDateNZ.getHours();
+    const sentDate = startOfDay(sentDateNZ); // Normalize to start of day for date checks
+
+    // Check if sent date is a working day
+    const isSentDateWorkingDay = isNZWorkingDay(sentDate, region);
+
+    // Rule 1: Not a working day → next working day
+    if (!isSentDateWorkingDay) {
+        return getNextWorkingDay(addDays(sentDate, 1), region);
+    }
+
+    // Rule 2: Working day but after 5 PM NZ time → next working day
+    if (sentHourNZ >= 17) {
+        return getNextWorkingDay(addDays(sentDate, 1), region);
+    }
+
+    // Rule 3: Working day before 5 PM NZ time → same day
+    return sentDate;
+}
+
+/**
+ * Calculates the expiry date for a notice based on RTA requirements.
+ *
+ * Notice Types:
+ * - S56_REMEDY: Service Date + 14 calendar days
+ * - S55_STRIKE (3rd strike): Service Date + 28 calendar days (tribunal filing window)
+ * - S55_21DAYS: No expiry (immediate tribunal eligibility)
+ *
+ * @param officialServiceDate - The OSD calculated by calculateServiceDate()
+ * @param noticeType - The type of notice
+ * @param strikeNumber - For strike notices, which strike (1, 2, or 3)
+ * @returns Expiry date (Date object) or null if no expiry applies
+ *
+ * @example
+ * ```typescript
+ * // const osd = calculateServiceDate(new Date('2026-01-19T16:00:00Z'), 'Auckland');
+ * // const expiry = calculateNoticeExpiryDate(osd, 'S56_REMEDY');
+ * // expiry = 2026-02-02 (14 days after OSD)
+ * ```
+ */
+export function calculateNoticeExpiryDate(
+    officialServiceDate: Date,
+    noticeType: NoticeType,
+    strikeNumber?: number
+): Date | null {
+    if (noticeType === 'S56_REMEDY') {
+        // 14 calendar days to remedy
+        return addDays(officialServiceDate, 14);
+    }
+
+    if (noticeType === 'S55_STRIKE' && strikeNumber === 3) {
+        // 28 calendar days to apply to tribunal after 3rd strike
+        return addDays(officialServiceDate, 28);
+    }
+
+    if (noticeType === 'S55_21DAYS') {
+        // No expiry - immediate tribunal eligibility
+        return null;
+    }
+
+    // Strike 1 and 2 don't have expiry dates
+    return null;
 }
 
 /**
@@ -176,32 +325,48 @@ export function countWorkingDays(startDate: Date, endDate: Date, region?: NZRegi
 // SERVICE DATE CALCULATIONS
 // ============================================================================
 
-const EMAIL_CUTOFF_HOUR = 17; // 5:00 PM
+const EMAIL_CUTOFF_HOUR = 17; // 5:00 PM NZ time
+const NZ_TIMEZONE = "Pacific/Auckland"; // IANA timezone for New Zealand
 
 /**
  * Calculates the Official Service Date (OSD) for an email notice.
  *
- * Rules:
- * - If sent before/at 5:00 PM on a working day: OSD = same day
- * - If sent after 5:00 PM or on a non-working day: OSD = next working day
+ * CRITICAL: Uses NZ timezone for the 5 PM cutoff rule.
+ * The RTA Section 136 5 PM rule refers to NZ time, not server time.
  *
- * @param sentTimestamp - ISO timestamp of when email was sent
+ * Rules:
+ * - If sent before 5:00 PM NZ time on a working day: OSD = same day
+ * - If sent after 5:00 PM NZ time or on a non-working day: OSD = next working day
+ *
+ * @param sentTimestamp - ISO timestamp of when email was sent (any timezone)
  * @param region - NZ region for regional holiday calculations
  * @returns Official Service Date as YYYY-MM-DD string
+ *
+ * @example
+ * ```typescript
+ * // Server in UTC, user sends at 6 PM NZDT (5 AM UTC)
+ * calculateOfficialServiceDate('2026-01-19T05:00:00Z', 'Auckland')
+ * // Correctly uses NZ time (6 PM) → next working day
+ * ```
  */
 export function calculateOfficialServiceDate(sentTimestamp: string, region?: NZRegion): string {
-    const sentDate = parseISO(sentTimestamp);
-    const sentHour = sentDate.getHours();
+    // Parse the timestamp (could be in any timezone)
+    const sentDateUTC = parseISO(sentTimestamp);
 
-    // Determine candidate date based on 5:00 PM rule
+    // CRITICAL: Convert to NZ timezone before checking the hour
+    // This ensures we check against 5 PM NZ time, not server time
+    const sentDateNZ = toZonedTime(sentDateUTC, NZ_TIMEZONE);
+    const sentHourNZ = sentDateNZ.getHours();
+
+    // Determine candidate date based on 5:00 PM NZ time rule
     let candidateDate: Date;
 
-    if (sentHour < EMAIL_CUTOFF_HOUR) {
-        // Sent before 5:00 PM - candidate is same day
-        candidateDate = sentDate;
+    if (sentHourNZ < EMAIL_CUTOFF_HOUR) {
+        // Sent before 5:00 PM NZ time - candidate is same day
+        candidateDate = startOfDay(sentDateNZ);
     } else {
-        // Sent at or after 5:00 PM - candidate is next day
-        candidateDate = addDays(sentDate, 1);
+        // Sent at or after 5:00 PM NZ time - candidate is next day
+        candidateDate = addDays(startOfDay(sentDateNZ), 1);
     }
 
     // Validate that candidate is a working day, otherwise get next working day
@@ -274,23 +439,40 @@ export function calculate90DayWindowExpiry(firstStrikeOSD: string): string {
 }
 
 /**
- * Filters strikes to only those valid within the 90-day window.
+ * Filters strikes to only those valid within the 90-day rolling window.
+ *
+ * CRITICAL: Window Reset Behavior
+ * - Each strike is checked independently against the CURRENT DATE
+ * - If Strike 1 is 100 days old, it is EXPIRED and filtered out
+ * - If a new strike is issued after the old ones expire, it becomes the "first strike" of a NEW window
+ * - This ensures the 90-day window properly "resets" when old strikes age out
+ *
+ * Example:
+ * - Jan 1: Strike 1 issued
+ * - Jan 10: Strike 2 issued
+ * - May 1 (120 days later): Strike 1 & 2 are both EXPIRED (> 90 days old)
+ * - May 5: New strike issued → This becomes "Strike 1" of a FRESH 90-day window
  *
  * @param strikes - Array of strike records
- * @returns Array of strikes within the current 90-day window
+ * @param currentDate - Current date for window calculation (defaults to now)
+ * @returns Array of strikes within the current 90-day rolling window, sorted chronologically
  */
-export function getValidStrikesInWindow(strikes: StrikeRecord[]): StrikeRecord[] {
+export function getValidStrikesInWindow(strikes: StrikeRecord[], currentDate: Date = new Date()): StrikeRecord[] {
     if (strikes.length === 0) return [];
 
-    // Sort by OSD
-    const sorted = [...strikes].sort((a, b) =>
+    // Filter to strikes within 90 days of CURRENT DATE (not first strike)
+    // This allows the window to naturally "reset" when old strikes expire
+    const activeStrikes = strikes.filter(strike => {
+        const serviceDate = parseISO(strike.officialServiceDate);
+        const daysSinceService = differenceInCalendarDays(currentDate, serviceDate);
+
+        // Strike is valid if it's 0-90 days old from current date
+        return daysSinceService >= 0 && daysSinceService <= 90;
+    });
+
+    // Sort by OSD (chronologically)
+    return activeStrikes.sort((a, b) =>
         a.officialServiceDate.localeCompare(b.officialServiceDate)
-    );
-
-    const firstStrikeOSD = sorted[0].officialServiceDate;
-
-    return sorted.filter(strike =>
-        isWithin90DayWindow(firstStrikeOSD, strike.officialServiceDate)
     );
 }
 
@@ -372,26 +554,65 @@ export function calculateTotalArrears(ledger: LedgerEntry[]): number {
  * @returns Complete analysis result
  */
 export function analyzeTenancySituation(input: AnalysisInput): AnalysisResult {
-    const { ledger, strikeHistory, behaviorNotes, region } = input;
+    const { strikeHistory, behaviorNotes, region, trackingStartDate, openingArrears = 0 } = input;
     const currentDate = input.currentDate || new Date();
 
-    // Calculate arrears
-    const daysArrears = calculateDaysInArrears(ledger, currentDate);
-    const totalArrears = calculateTotalArrears(ledger);
+    // 1. FILTER LEDGER FOR "GHOST PAYMENTS"
+    // If tracking start date is provided, filter out any payments due BEFORE we started tracking
+    let ledger = input.ledger;
+    if (trackingStartDate) {
+        ledger = getValidLedger(input.ledger, trackingStartDate);
+    }
 
-    // Get oldest unpaid entry for working days calculation
-    const unpaidEntries = ledger.filter(e => e.status === "Unpaid" || e.status === "Partial");
-    const oldestUnpaid = unpaidEntries.length > 0
-        ? unpaidEntries.sort((a, b) => a.dueDate.localeCompare(b.dueDate))[0]
-        : null;
+    // 2. FILTER LEDGER FOR FUTURE PAYMENTS
+    // CRITICAL: Only include payments that are due on or before the current date
+    // Payments due in the future should NOT count toward arrears (they're not yet due)
+    ledger = ledger.filter(entry => {
+        const dueDate = parseISO(entry.dueDate);
+        // Include only if dueDate <= currentDate
+        return isBefore(dueDate, currentDate) || isEqual(dueDate, currentDate);
+    });
 
-    const workingDaysOverdue = oldestUnpaid
-        ? calculateWorkingDaysOverdue(oldestUnpaid.dueDate, currentDate, region)
-        : 0;
+    // 3. CALCULATE ARREARS
+    // Total = Opening Arrears + Unpaid entries after Tracking Start Date (and on or before current date)
+    const ledgerArrears = calculateTotalArrears(ledger);
+    const totalArrears = openingArrears + ledgerArrears;
+
+    // 4. CALCULATE DAYS IN ARREARS
+    // If opening arrears exist, use tracking start date as the "due date" for that balance
+    // Otherwise, use the normal calculation based on ledger entries
+    let daysArrears: number;
+    if (openingArrears > 0 && trackingStartDate) {
+        // Opening arrears are considered overdue from the tracking start date
+        const trackingStart = parseISO(trackingStartDate);
+        daysArrears = Math.max(0, differenceInCalendarDays(currentDate, trackingStart));
+    } else {
+        daysArrears = calculateDaysInArrears(ledger, currentDate);
+    }
+
+    // 5. CALCULATE WORKING DAYS OVERDUE
+    // If opening arrears exist, use tracking start date for working days calculation
+    // Otherwise, use the oldest unpaid ledger entry
+    let workingDaysOverdue = 0;
+
+    if (openingArrears > 0 && trackingStartDate) {
+        // Opening arrears: calculate working days from tracking start date
+        workingDaysOverdue = calculateWorkingDaysOverdue(trackingStartDate, currentDate, region);
+    } else {
+        // Normal calculation: use oldest unpaid entry from ledger
+        const unpaidEntries = ledger.filter(e => e.status === "Unpaid" || e.status === "Partial");
+        const oldestUnpaid = unpaidEntries.length > 0
+            ? unpaidEntries.sort((a, b) => a.dueDate.localeCompare(b.dueDate))[0]
+            : null;
+
+        workingDaysOverdue = oldestUnpaid
+            ? calculateWorkingDaysOverdue(oldestUnpaid.dueDate, currentDate, region)
+            : 0;
+    }
 
     // Get valid strikes within 90-day window
     const rentStrikes = strikeHistory.filter(s => s.type === "S55_STRIKE");
-    const validStrikes = getValidStrikesInWindow(rentStrikes);
+    const validStrikes = getValidStrikesInWindow(rentStrikes, currentDate);
     const strikeCount = validStrikes.length;
 
     const firstStrikeOSD = validStrikes.length > 0 ? validStrikes[0].officialServiceDate : undefined;
@@ -414,6 +635,7 @@ export function analyzeTenancySituation(input: AnalysisInput): AnalysisResult {
                 isWithin90Days,
                 daysArrears,
                 workingDaysOverdue,
+                totalArrears, // Filtered total from legal engine
                 firstStrikeOSD,
                 windowExpiryDate,
             },
@@ -447,6 +669,7 @@ export function analyzeTenancySituation(input: AnalysisInput): AnalysisResult {
                     isWithin90Days: true,
                     daysArrears,
                     workingDaysOverdue,
+                    totalArrears, // Filtered total from legal engine
                     firstStrikeOSD,
                     windowExpiryDate,
                 },
@@ -477,6 +700,7 @@ export function analyzeTenancySituation(input: AnalysisInput): AnalysisResult {
                 isWithin90Days,
                 daysArrears,
                 workingDaysOverdue,
+                totalArrears, // Filtered total from legal engine
                 firstStrikeOSD,
                 windowExpiryDate,
             },
@@ -505,6 +729,7 @@ export function analyzeTenancySituation(input: AnalysisInput): AnalysisResult {
             isWithin90Days,
             daysArrears,
             workingDaysOverdue,
+            totalArrears, // Filtered total from legal engine
             firstStrikeOSD,
             windowExpiryDate,
         },
@@ -587,7 +812,7 @@ export function canIssueStrikeNotice(
         };
     }
 
-    const validStrikes = getValidStrikesInWindow(existingStrikes.filter(s => s.type === "S55_STRIKE"));
+    const validStrikes = getValidStrikesInWindow(existingStrikes.filter(s => s.type === "S55_STRIKE"), currentDate);
 
     if (validStrikes.length >= 3) {
         return {

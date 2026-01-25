@@ -1,4 +1,5 @@
-import { parseISO, addDays, addWeeks, isBefore, isAfter, format, getDay } from "date-fns";
+import { addDays, addMonths, isAfter, format, getDay, setDate, startOfDay } from "date-fns";
+import { PaymentFrequency } from "@/types";
 
 /**
  * Day of week mapping for rent due days
@@ -28,8 +29,6 @@ export function findNextDueDay(startDate: Date, targetDayName: string): Date {
     const currentDay = getDay(startDate);
 
     // Calculate days to add using modulo to handle week wraparound
-    // Formula: (targetDay - currentDay + 7) % 7
-    // If result is 0, target day is today, so use 0 (not 7)
     let daysToAdd = (targetDay - currentDay + 7) % 7;
 
     console.log('🔍 Intermediate calculation:', {
@@ -55,27 +54,53 @@ export function findNextDueDay(startDate: Date, targetDayName: string): Date {
 }
 
 /**
- * Calculate all rent due dates from lease start to today
- * @param leaseStartDate - ISO string of lease start date
- * @param frequency - "Weekly" or "Fortnightly"
- * @param rentDueDay - Day of week when rent is due (e.g., "Sunday")
+ * Find the next monthly due date on or after a given date
+ * @param startDate - The date to start from
+ * @param dayOfMonth - Day of month (1-28)
+ * @returns The next occurrence of that day of month
+ */
+export function findNextMonthlyDueDate(startDate: Date, dayOfMonth: number): Date {
+    const normalizedStart = startOfDay(startDate);
+    const currentDayOfMonth = normalizedStart.getDate();
+
+    // If current day is before or on the due day this month, use this month
+    // Otherwise, use next month
+    let result: Date;
+    if (currentDayOfMonth <= dayOfMonth) {
+        result = setDate(normalizedStart, dayOfMonth);
+    } else {
+        // Move to next month, then set the day
+        result = setDate(addMonths(normalizedStart, 1), dayOfMonth);
+    }
+
+    console.log('🔍 findNextMonthlyDueDate DEBUG:', {
+        startDate: format(startDate, 'yyyy-MM-dd'),
+        dayOfMonth,
+        currentDayOfMonth,
+        resultDate: format(result, 'yyyy-MM-dd')
+    });
+
+    return result;
+}
+
+/**
+ * Calculate all rent due dates from a start point to today
+ * @param frequency - "Weekly", "Fortnightly", or "Monthly"
+ * @param rentDueDay - Day of week (for Weekly/Fortnightly) or day of month as string (for Monthly)
  * @param today - Current date (or test date override)
+ * @param generationStartDate - Optional start date for generation
  * @returns Array of ISO date strings for all due dates
  */
 export function calculateDueDates(
-    frequency: "Weekly" | "Fortnightly",
+    frequency: PaymentFrequency,
     rentDueDay: string,
     today: Date = new Date(),
     generationStartDate?: Date
 ): string[] {
     const dueDates: string[] = [];
-
-    // CRITICAL: Payments ALWAYS start from Today (or the next available due date from today)
-    // lease_start_date is ignored for calculations.
     const startSearchingFrom = generationStartDate || today;
 
-    // User requested debug log
-    console.log('📅 CALCULATING DUE DATES (Simplified):', {
+    console.log('📅 CALCULATING DUE DATES:', {
         generationStartDate: generationStartDate ? format(generationStartDate, 'yyyy-MM-dd') : 'Using Today',
         startSearchingFrom: format(startSearchingFrom, 'yyyy-MM-dd'),
         today: format(today, 'yyyy-MM-dd'),
@@ -83,33 +108,40 @@ export function calculateDueDates(
         frequency
     });
 
-    // Find first due date on or after the determined start point
-    let currentDueDate = findNextDueDay(startSearchingFrom, rentDueDay);
+    let currentDueDate: Date;
 
-    // Calculate interval based on frequency
-    const intervalDays = frequency === "Weekly" ? 7 : 14;
+    // Determine first due date based on frequency
+    if (frequency === "Monthly") {
+        const dayOfMonth = parseInt(rentDueDay, 10) || 1;
+        currentDueDate = findNextMonthlyDueDate(startSearchingFrom, dayOfMonth);
+    } else {
+        currentDueDate = findNextDueDay(startSearchingFrom, rentDueDay);
+    }
 
-    // Generate all due dates up to and INCLUDING the next upcoming due date
     const todayObj = today instanceof Date ? today : new Date(today);
-    const todayTime = new Date(todayObj.getFullYear(), todayObj.getMonth(), todayObj.getDate()).getTime();
+    const todayTime = startOfDay(todayObj).getTime();
 
-    // Safety limit: 100 iterations or ~2 years for Weekly
+    // Safety limit: 100 iterations
     let iterations = 0;
     while (iterations < 100) {
         iterations++;
 
-        // Ensure we record the due date
         dueDates.push(format(currentDueDate, "yyyy-MM-dd"));
 
-        // Check if we've reached our goal: 
-        // We have at least one payment that is TODAY or in the FUTURE
-        const currentTime = new Date(currentDueDate.getFullYear(), currentDueDate.getMonth(), currentDueDate.getDate()).getTime();
+        // Check if we've reached today or future
+        const currentTime = startOfDay(currentDueDate).getTime();
         if (currentTime >= todayTime) {
             break;
         }
 
-        // Advance to next period
-        currentDueDate = addDays(currentDueDate, intervalDays);
+        // Advance to next period based on frequency
+        if (frequency === "Monthly") {
+            currentDueDate = addMonths(currentDueDate, 1);
+        } else if (frequency === "Fortnightly") {
+            currentDueDate = addDays(currentDueDate, 14);
+        } else {
+            currentDueDate = addDays(currentDueDate, 7);
+        }
 
         // Fail-safe: don't generate more than 1 year into future
         if (isAfter(currentDueDate, addDays(todayObj, 366))) {
@@ -122,20 +154,32 @@ export function calculateDueDates(
 }
 
 /**
+ * Get the interval for advancing to the next payment period
+ * @param frequency - Payment frequency
+ * @param currentDate - Current date to calculate from (for Monthly)
+ * @returns Object with method to get next date
+ */
+export function getNextPaymentDate(frequency: PaymentFrequency, currentDate: Date): Date {
+    switch (frequency) {
+        case "Monthly":
+            return addMonths(currentDate, 1);
+        case "Fortnightly":
+            return addDays(currentDate, 14);
+        case "Weekly":
+        default:
+            return addDays(currentDate, 7);
+    }
+}
+
+/**
  * Calculate due dates with lease end date consideration
- * @param leaseStartDate - ISO string of lease start date
- * @param frequency - "Weekly" or "Fortnightly"
- * @param rentDueDay - Day of week when rent is due
- * @param today - Current date (or test date override)
- * @param leaseEndDate - Optional ISO string of lease end date
- * @returns Array of ISO date strings for all due dates
  */
 export function calculateDueDatesWithEndDate(
-    leaseStartDate: string | undefined, // Ignored
-    frequency: "Weekly" | "Fortnightly",
+    _leaseStartDate: string | undefined,
+    frequency: PaymentFrequency,
     rentDueDay: string,
     today: Date = new Date(),
-    leaseEndDate?: string, // Ignored
+    _leaseEndDate?: string,
     generationStartDate?: Date
 ): string[] {
     return calculateDueDates(frequency, rentDueDay, today, generationStartDate);
@@ -143,9 +187,6 @@ export function calculateDueDatesWithEndDate(
 
 /**
  * Check if a payment record should be generated for a due date
- * @param dueDate - The due date to check
- * @param existingPayments - Array of existing payment due dates for this tenant
- * @returns true if payment should be generated, false if duplicate
  */
 export function shouldGeneratePayment(
     dueDate: string,

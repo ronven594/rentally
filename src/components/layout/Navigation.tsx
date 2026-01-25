@@ -1,12 +1,12 @@
 "use client"
 
 import { MobileNav } from "./MobileNav"
-import { DesktopNav } from "./DesktopNav"
+import { TopNav } from "./TopNav"
 
 export function Navigation() {
     return (
         <>
-            <DesktopNav />
+            <TopNav />
             <MobileNav />
         </>
     )

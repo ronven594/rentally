@@ -163,7 +163,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                     <p className="text-red-600 font-bold mb-4">{error}</p>
                     <button
                         onClick={() => window.location.reload()}
-                        className="px-4 py-2 bg-slate-900 text-white rounded-xl"
+                        className="px-4 py-2 bg-nav-black text-white rounded-xl font-black"
                     >
                         Retry
                     </button>

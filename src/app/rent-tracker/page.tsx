@@ -7,15 +7,20 @@ import { AddPropertyDialog } from "@/components/dashboard/AddPropertyDialog"
 import { ManageTenantDialog } from "@/components/dashboard/ManageTenantDialog"
 import { ConfirmationDialog } from "@/components/dashboard/ConfirmationDialog"
 import { Property, Tenant, RentPayment, PaymentStatus } from "@/types"
-import { differenceInCalendarDays, parseISO, format, addDays, startOfDay } from "date-fns"
+import { differenceInCalendarDays, parseISO, format, addDays, addMonths, startOfDay } from "date-fns"
 import { calculateDueDates } from "@/lib/payment-automation"
 import { logToEvidenceLedger, EVENT_TYPES, CATEGORIES } from "@/services/evidenceLedger"
-import { Plus, Building2, Users } from "lucide-react"
+import { Plus, Building2, Users, AlertCircle, Loader2 } from "lucide-react"
+import { UpcomingObligations } from "@/components/dashboard/UpcomingObligations"
+import { PortfolioReassuranceBanner } from "@/components/dashboard/PortfolioReassuranceBanner"
+import { getObligationMessages } from "@/lib/status-engine"
 import { Button } from "@/components/ui/button"
 import { toast } from "sonner"
 import { supabase } from "@/lib/supabaseClient"
 import { usePathname } from "next/navigation"
 import { useAuth } from "@/contexts/AuthContext"
+import { calculateRentalLogic, type RentalLogicResult } from "@/hooks/useRentalLogic"
+import type { StrikeRecord, NoticeType } from "@/lib/legal-engine"
 
 // Initial Properties with Tenants
 const INITIAL_PROPERTIES: Property[] = [];
@@ -24,6 +29,7 @@ export default function RentTrackerPage() {
     const { profile } = useAuth();
     const [properties, setProperties] = useState<Property[]>([]);
     const [payments, setPayments] = useState<RentPayment[]>([]);
+    const [strikeHistories, setStrikeHistories] = useState<Record<string, StrikeRecord[]>>({});
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [isAddPropertyOpen, setIsAddPropertyOpen] = useState(false);
@@ -154,6 +160,47 @@ export default function RentTrackerPage() {
         };
     }, [fetchProperties, fetchPayments]);
 
+    // Fetch strike histories for legal compliance
+    useEffect(() => {
+        const fetchStrikeHistories = async () => {
+            if (!properties.length) return;
+
+            console.log('📊 Fetching strike histories for RTA compliance...');
+            const histories: Record<string, StrikeRecord[]> = {};
+
+            for (const property of properties) {
+                for (const tenant of property.tenants) {
+                    const { data, error } = await supabase.rpc('get_notice_timeline', {
+                        p_tenant_id: tenant.id
+                    });
+
+                    if (error) {
+                        console.error(`Error fetching strikes for ${tenant.name}:`, error);
+                        continue;
+                    }
+
+                    if (data) {
+                        histories[tenant.id] = data
+                            .filter((n: any) => n.is_strike)
+                            .map((n: any) => ({
+                                noticeId: n.notice_id,
+                                sentDate: n.sent_at,
+                                officialServiceDate: n.official_service_date,
+                                type: n.notice_type as NoticeType,
+                                rentDueDate: n.rent_due_date,
+                                amountOwed: n.amount_owed,
+                            }));
+                    }
+                }
+            }
+
+            setStrikeHistories(histories);
+            console.log('✅ Strike histories loaded:', Object.keys(histories).length, 'tenants');
+        };
+
+        fetchStrikeHistories();
+    }, [properties]);
+
     // Auto-generate payment records for all tenants
     const autoGeneratePayments = async () => {
         if (properties.length === 0) return;
@@ -163,9 +210,12 @@ export default function RentTrackerPage() {
 
         for (const property of properties) {
             for (const tenant of property.tenants) {
-                // Skip if no lease start date
-                if (!tenant.startDate) {
-                    console.warn(`⚠️ Skipping ${tenant.name}: No lease start date`);
+                // Determine the tracking start date (prefer trackingStartDate, fallback to startDate)
+                const effectiveTrackingStart = tenant.trackingStartDate || tenant.startDate;
+
+                // Skip if no tracking start date
+                if (!effectiveTrackingStart) {
+                    console.warn(`⚠️ Skipping ${tenant.name}: No tracking start date`);
                     continue;
                 }
 
@@ -184,11 +234,11 @@ export default function RentTrackerPage() {
                     // User requested deep-dive debug log
                     console.log('🔍 AUTO-GENERATION DEBUG - START:', {
                         tenantName: tenant.name,
-                        leaseStartDate: tenant.startDate || 'Not provided',
+                        trackingStartDate: effectiveTrackingStart,
+                        openingArrears: tenant.openingArrears || 0,
                         todayDate: format(testDate || new Date(), 'yyyy-MM-dd'),
                         rentDueDay: tenant.rentDueDay,
                         existingPaymentsInDB: existingPayments,
-                        calculationStartDate: 'TODAY (Lease Start Ignored)'
                     });
 
                     // Simplified Generation Logic (Only on Day 7)
@@ -199,14 +249,15 @@ export default function RentTrackerPage() {
                     let dueDates: string[] = [];
 
                     if (!mostRecentPayment) {
-                        // First payment generation: use TODAY as start point
+                        // First payment generation: use TRACKING START DATE as start point
+                        const generationStartDate = parseISO(effectiveTrackingStart);
                         dueDates = calculateDueDates(
                             tenant.frequency,
                             tenant.rentDueDay,
                             testDate || new Date(),
-                            testDate || new Date()
+                            generationStartDate
                         );
-                        console.log(`🆕 First payment generation for ${tenant.name}:`, dueDates);
+                        console.log(`🆕 First payment generation for ${tenant.name} from tracking start ${effectiveTrackingStart}:`, dueDates);
                     } else {
                         const todayDate = testDate || new Date();
                         const daysFromDueDate = differenceInCalendarDays(todayDate, parseISO(mostRecentPayment.dueDate));
@@ -218,24 +269,27 @@ export default function RentTrackerPage() {
                             status: mostRecentPayment.status
                         });
 
-                        // Only generate next if we hit Day 7 (and current is Paid OR we're in test mode)
-                        // This corresponds to the user's "Every Sunday" requirement
-                        // When testDate is active, allow generation even if unpaid (for testing scenarios)
-                        const triggerDay = tenant.frequency === 'Fortnightly' ? 14 : 7;
+                        // Only generate next if we hit the trigger day (and current is Paid OR we're in test mode)
+                        // Trigger days: Weekly = 7, Fortnightly = 14, Monthly = 28
+                        const triggerDay = tenant.frequency === 'Monthly' ? 28 : tenant.frequency === 'Fortnightly' ? 14 : 7;
                         const isTestMode = testDate !== null;
                         const shouldGenerate = isTestMode
                             ? daysFromDueDate >= triggerDay
                             : (daysFromDueDate >= triggerDay && mostRecentPayment.status === 'Paid');
 
                         if (shouldGenerate) {
-                            const interval = tenant.frequency === 'Fortnightly' ? 14 : 7;
                             const todayNormalized = startOfDay(todayDate);
 
                             // Generate ALL missing payments up to today, not just the next one
-                            let nextDate = addDays(parseISO(mostRecentPayment.dueDate), interval);
+                            let nextDate = tenant.frequency === 'Monthly'
+                                ? addMonths(parseISO(mostRecentPayment.dueDate), 1)
+                                : addDays(parseISO(mostRecentPayment.dueDate), tenant.frequency === 'Fortnightly' ? 14 : 7);
+
                             while (startOfDay(nextDate) <= todayNormalized) {
                                 dueDates.push(format(nextDate, 'yyyy-MM-dd'));
-                                nextDate = addDays(nextDate, interval);
+                                nextDate = tenant.frequency === 'Monthly'
+                                    ? addMonths(nextDate, 1)
+                                    : addDays(nextDate, tenant.frequency === 'Fortnightly' ? 14 : 7);
                             }
 
                             console.log(`📅 Day ${triggerDay}+ reached! Auto-generating ${dueDates.length} payment(s) for ${tenant.name}${isTestMode ? ' (TEST MODE)' : ''}:`, dueDates);
@@ -343,39 +397,43 @@ export default function RentTrackerPage() {
     useEffect(() => {
         if (properties.length > 0 && totalTenantCount > 0 && !loading) {
             console.log("🔄 Auto-generation effect triggered - checking for missing payments", {
-                testDate: testDate ? format(testDate, 'yyyy-MM-dd') : 'current date'
+                testDate: testDate ? format(testDate, 'yyyy-MM-dd') : format(new Date(), 'yyyy-MM-dd')
             });
             autoGeneratePayments();
         }
     }, [properties.length, totalTenantCount, loading, testDate]); // Include testDate to re-generate when date changes
 
-    // Helper to get tenant state
-    const getTenantState = useCallback((tenantId: string) => {
-        // Find ALL unpaid payments for this tenant
-        const unpaidPayments = payments.filter(p => p.tenantId === tenantId && (p.status === "Unpaid" || p.status === "Partial"));
+    // Calculate RTA-compliant legal status for each tenant
+    const tenantLegalStatuses = useMemo(() => {
+        const statuses: Record<string, RentalLogicResult> = {};
 
-        if (unpaidPayments.length === 0) return { isUnpaid: false, totalArrears: 0 };
+        properties.forEach(property => {
+            property.tenants.forEach(tenant => {
+                const tenantPayments = payments.filter(p => p.tenantId === tenant.id);
+                const strikeHistory = strikeHistories[tenant.id] || [];
 
-        const today = testDate || new Date();
-        const pastDueUnpaid = unpaidPayments.filter(p => {
-            const due = parseISO(p.dueDate);
-            return differenceInCalendarDays(today, due) >= 0;
+                statuses[tenant.id] = calculateRentalLogic({
+                    tenantId: tenant.id,
+                    payments: tenantPayments,
+                    strikeHistory,
+                    region: property.region || 'Auckland',
+                    currentDate: testDate || undefined,
+                    trackingStartDate: tenant.trackingStartDate || tenant.startDate, // When we started tracking (or lease start as fallback)
+                    openingArrears: tenant.openingArrears || 0, // Any existing debt when we started tracking
+                });
+            });
         });
 
-        const totalArrears = unpaidPayments.reduce((sum, p) => sum + (p.amount - (p.amount_paid || 0)), 0);
+        return statuses;
+    }, [properties, payments, strikeHistories, testDate]);
 
-        return {
-            isUnpaid: pastDueUnpaid.length > 0,
-            totalArrears
-        };
-    }, [payments, testDate]);
-
-    // Record Payment (Oldest Dollar First)
-    const handleRecordPayment = async (tenantId: string, paymentAmount: number) => {
+    // Record Payment (Oldest Dollar First) - AI-first reconciliation model
+    const handleRecordPayment = async (tenantId: string, paymentAmount: number, paymentDate: string) => {
         try {
             console.log('💰 RECORD PAYMENT:', {
                 tenantId,
-                paymentAmount
+                paymentAmount,
+                paymentDate
             });
 
             // Get all unpaid payments for this tenant, oldest first
@@ -434,7 +492,8 @@ export default function RentTrackerPage() {
                 // Determine new status
                 const isFullyPaid = newAmountPaid >= (payment.amount - 0.01);
                 const newStatus = isFullyPaid ? 'Paid' : 'Partial';
-                const paidDate = isFullyPaid ? new Date().toISOString() : null;
+                // Use the payment date from the modal (already ISO format from date input)
+                const paidDate = isFullyPaid ? new Date(paymentDate).toISOString() : null;
 
                 console.log(`⚠️ Allocating to payment:`, {
                     paymentId: payment.id,
@@ -676,130 +735,151 @@ export default function RentTrackerPage() {
         }
     };
 
-    // Build state maps for PropertyCard reactively
-    const { tenantStates } = useMemo(() => {
-        const states: Record<string, { isUnpaid: boolean; totalArrears: number }> = {};
+    // Build portfolio status from legal statuses
+    const { obligations, isPortfolioSweetAs } = useMemo(() => {
+        const tenantObligations: Array<{ name: string; propertyAddress: string; daysLate: number; calendarDays?: number }> = [];
+        let allSweetAs = true;
 
         properties.forEach(property => {
             property.tenants.forEach(tenant => {
-                states[tenant.id] = getTenantState(tenant.id);
+                const legalStatus = tenantLegalStatuses[tenant.id];
+                if (!legalStatus) return;
+
+                // Check if any tenant is not sweet as
+                if (legalStatus.status !== 'CLEAR') {
+                    allSweetAs = false;
+                }
+
+                // Collect obligations for the banner
+                // Include ALL overdue states: Monitor (1+ calendar days), Strike 1 (5+), Strike 2+ (10+)
+                if (legalStatus.daysOverdue >= 1) {
+                    tenantObligations.push({
+                        name: tenant.name,
+                        propertyAddress: property.address,
+                        daysLate: legalStatus.workingDaysOverdue,  // Use working days for legal compliance
+                        calendarDays: legalStatus.daysOverdue,     // Calendar days for Monitor phase display
+                    });
+                }
             });
         });
 
-        return { tenantStates: states };
-    }, [properties, payments, testDate, getTenantState]);
+        // Portfolio is sweet as only if there are tenants and all are good
+        const hasTenants = properties.some(p => p.tenants.length > 0);
+
+        return {
+            obligations: getObligationMessages(tenantObligations),
+            isPortfolioSweetAs: hasTenants && allSweetAs,
+        };
+    }, [properties, tenantLegalStatuses]);
 
     const managingTenant = properties.flatMap(p => p.tenants).find(t => t.id === managingTenantId);
     const totalTenants = properties.reduce((acc, p) => acc + p.tenants.length, 0);
 
     return (
-        <div className="min-h-screen pb-20">
-            {/* Clinical Top Bar */}
-            <div className="sticky top-0 z-10 bg-white/80 backdrop-blur-md border-b border-slate-50">
-                <div className="max-w-4xl mx-auto px-6 h-16 flex items-center justify-between">
-                    <div className="flex items-center gap-6">
-                        <div className="flex items-center gap-2">
-                            <span className="text-sm font-black text-slate-900 tracking-tighter uppercase">Overview</span>
-                        </div>
-                        <div className="h-4 w-px bg-slate-100" />
-                        <div className="flex items-center gap-4 text-xs font-bold text-slate-400">
-                            <div className="flex items-center gap-1.5">
-                                <Building2 className="w-3.5 h-3.5" />
-                                {properties.length} Properties
+        <div className="min-h-screen bg-[#0B0E11]">
+            {/* Command Center Header */}
+            <div className="border-b border-white/5 bg-[#0B0E11]">
+                <div className="max-w-7xl mx-auto px-6 py-6">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <h1 className="text-2xl font-black text-white tracking-tight">
+                                Property Command Center
+                            </h1>
+                            <div className="flex items-center gap-4 mt-2 text-xs font-bold text-white/40">
+                                <div className="flex items-center gap-1.5">
+                                    <Building2 className="w-3.5 h-3.5" />
+                                    {properties.length} Properties
+                                </div>
+                                <div className="w-1 h-1 rounded-full bg-white/20" />
+                                <div className="flex items-center gap-1.5">
+                                    <Users className="w-3.5 h-3.5" />
+                                    {totalTenants} Tenants
+                                </div>
                             </div>
-                            <div className="flex items-center gap-1.5">
-                                <Users className="w-3.5 h-3.5" />
-                                {totalTenants} Tenants
-                            </div>
                         </div>
-                    </div>
 
-                    <button
-                        onClick={() => setIsAddPropertyOpen(true)}
-                        className="h-10 px-5 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-sm font-bold flex items-center gap-2 transition-all active:scale-95 shadow-lg shadow-slate-200"
-                    >
-                        <Plus className="w-4 h-4" />
-                        Add Property
-                    </button>
-                </div>
-            </div>
-
-            {/* TESTING ONLY: Date Override */}
-            <div className="bg-rose-50 border-b border-rose-100 py-2 px-6">
-                <div className="max-w-4xl mx-auto flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                        <AlertCircle className="w-4 h-4 text-rose-500" />
-                        <span className="text-[10px] font-black uppercase tracking-widest text-rose-600">Testing Only: Date Override</span>
-                    </div>
-                    <div className="flex items-center gap-3">
-                        {isMounted && (
-                            <input
-                                type="date"
-                                value={testDate ? format(testDate, 'yyyy-MM-dd') : ""}
-                                onChange={(e) => setTestDate(e.target.value ? parseISO(e.target.value) : null)}
-                                className="bg-white border border-rose-200 rounded-lg px-2 py-1 text-xs font-bold text-slate-700 focus:outline-none focus:ring-1 focus:ring-rose-400"
-                            />
-                        )}
-                        {testDate && (
-                            <button
-                                onClick={() => setTestDate(null)}
-                                className="text-[10px] font-black uppercase tracking-widest text-rose-500 hover:text-rose-700 underline"
-                            >
-                                Reset to Today
-                            </button>
-                        )}
+                        {/* TESTING ONLY: Date Override */}
+                        <div className="flex items-center gap-3 px-4 py-2 bg-[#FF3B3B]/10 rounded-xl border border-[#FF3B3B]/20">
+                            <AlertCircle className="w-4 h-4 text-[#FF3B3B]" />
+                            <span className="text-[10px] font-black uppercase tracking-widest text-[#FF3B3B] hidden sm:inline">Test Mode</span>
+                            {isMounted && (
+                                <input
+                                    type="date"
+                                    value={testDate ? format(testDate, 'yyyy-MM-dd') : ""}
+                                    onChange={(e) => setTestDate(e.target.value ? parseISO(e.target.value) : null)}
+                                    className="bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-xs font-bold text-white focus:outline-none focus:ring-1 focus:ring-[#FF3B3B]/50"
+                                />
+                            )}
+                            {testDate && (
+                                <button
+                                    onClick={() => setTestDate(null)}
+                                    className="text-[10px] font-black uppercase tracking-widest text-[#FF3B3B] hover:text-[#FF3B3B]/80"
+                                >
+                                    Reset
+                                </button>
+                            )}
+                        </div>
                     </div>
                 </div>
             </div>
 
-            <div className="max-w-4xl mx-auto px-6 py-10">
+            {/* Main Content - Full Width Command Center */}
+            <div className="max-w-7xl mx-auto px-6 py-8">
+                {/* Portfolio-wide Reassurance Banner */}
+                <PortfolioReassuranceBanner show={isPortfolioSweetAs} />
+
+                {/* Smart Triage Banner (only shows if there are obligations) */}
+                <UpcomingObligations obligations={obligations} />
+
                 {loading ? (
                     <div className="py-20 flex flex-col items-center justify-center space-y-4">
-                        <Loader2 className="w-10 h-10 text-slate-300 animate-spin" />
-                        <p className="text-sm font-bold text-slate-400 uppercase tracking-widest">Loading Properties...</p>
+                        <Loader2 className="w-10 h-10 text-white/30 animate-spin" />
+                        <p className="text-sm font-bold text-white/40 uppercase tracking-widest">Loading Properties...</p>
                     </div>
                 ) : error ? (
                     <div className="py-20 text-center space-y-4">
-                        <div className="w-20 h-20 bg-rose-50 rounded-full flex items-center justify-center mx-auto text-rose-500">
+                        <div className="w-20 h-20 bg-[#FF3B3B]/10 rounded-full flex items-center justify-center mx-auto text-[#FF3B3B]">
                             <AlertCircle className="w-10 h-10" />
                         </div>
                         <div>
-                            <h3 className="text-xl font-bold text-slate-900">Connection Error</h3>
-                            <p className="text-slate-500 mt-2">{error}</p>
+                            <h3 className="text-xl font-bold text-white">Connection Error</h3>
+                            <p className="text-white/50 mt-2">{error}</p>
                         </div>
                         <Button
                             onClick={() => window.location.reload()}
-                            variant="secondary"
-                            className="mt-4 rounded-xl font-bold"
+                            variant="brand-secondary"
+                            size="brand"
+                            className="mt-4 rounded-xl"
                         >
                             Retry Connection
                         </Button>
                     </div>
                 ) : properties.length === 0 ? (
                     <div className="py-20 text-center space-y-4">
-                        <div className="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center mx-auto text-slate-300">
+                        <div className="w-20 h-20 bg-white/5 rounded-full flex items-center justify-center mx-auto text-white/30">
                             <Building2 className="w-10 h-10" />
                         </div>
                         <div>
-                            <h3 className="text-xl font-bold text-slate-900">No properties yet</h3>
-                            <p className="text-slate-500 mt-2">Add your first property to start tracking rent.</p>
+                            <h3 className="text-xl font-bold text-white">No properties yet</h3>
+                            <p className="text-white/50 mt-2">Add your first property to start tracking rent.</p>
                         </div>
                         <Button
                             onClick={() => setIsAddPropertyOpen(true)}
-                            variant="secondary"
-                            className="mt-4 rounded-xl font-bold"
+                            variant="brand-success"
+                            size="brand"
+                            className="mt-4 rounded-xl"
                         >
                             Get Started
                         </Button>
                     </div>
                 ) : (
-                    <div className="space-y-6">
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
                         {properties.map(property => (
                             <PropertyCard
                                 key={property.id}
                                 property={property}
                                 payments={payments}
-                                tenantStates={tenantStates}
+                                tenantLegalStatuses={tenantLegalStatuses}
                                 testDate={testDate || undefined}
                                 onRecordPayment={handleRecordPayment}
                                 onManageTenant={(tid) => setManagingTenantId(tid)}
@@ -844,6 +924,17 @@ export default function RentTrackerPage() {
                     onConfirm={confirmState.onConfirm}
                 />
             </div>
+
+            {/* Floating Action Button - Neon Mint */}
+            <Button
+                variant="brand"
+                size="brand"
+                onClick={() => setIsAddPropertyOpen(true)}
+                className="fixed bottom-24 right-4 shadow-[0_0_20px_rgba(0,255,187,0.3)] hover:scale-105 z-40 bg-[#00FFBB] text-[#0B0E11] hover:shadow-[0_0_30px_rgba(0,255,187,0.5)]"
+            >
+                <Plus className="w-4 h-4" />
+                ADD PROPERTY
+            </Button>
         </div>
     );
 }

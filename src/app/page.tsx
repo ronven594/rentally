@@ -1,93 +1,57 @@
 "use client"
 
-import Image from "next/image";
-
-import { useState } from 'react';
-import { supabase } from '@/lib/supabaseClient';
+import { useEffect } from 'react';
+import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/AuthContext';
-import { toast } from 'sonner';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
-import { Link as LinkIcon } from 'lucide-react';
-
-function LinkPropertiesButton() {
-  const { user } = useAuth();
-  const [loading, setLoading] = useState(false);
-
-  const handleLinkProperties = async () => {
-    if (!user) return;
-
-    setLoading(true);
-    try {
-      // Update all properties with null user_id
-      const { data, error } = await supabase
-        .from('properties')
-        .update({ user_id: user.id })
-        .is('user_id', null)
-        .select();
-
-      if (error) throw error;
-
-      toast.success(`Linked ${data?.length || 0} properties to your account`);
-
-      // Refresh the page to show updated data
-      window.location.reload();
-    } catch (error: any) {
-      toast.error('Failed to link properties');
-      console.error(error);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <button
-      onClick={handleLinkProperties}
-      disabled={loading}
-      className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-black uppercase tracking-widest text-xs rounded-full shadow-lg shadow-emerald-100 transition-all disabled:opacity-50"
-    >
-      <LinkIcon className="w-4 h-4" />
-      {loading ? 'Linking...' : 'Link My Properties'}
-    </button>
-  );
-}
+import { Building2, ArrowRight, Loader2 } from 'lucide-react';
+import Link from 'next/link';
 
 export default function Home() {
   const { user, profile, loading } = useAuth();
+  const router = useRouter();
 
-  console.log('🔐 Auth State (Home):', { user, profile, loading });
+  // Auto-redirect to rent-tracker if authenticated
+  useEffect(() => {
+    if (!loading && user) {
+      router.push('/rent-tracker');
+    }
+  }, [loading, user, router]);
 
   return (
     <ProtectedRoute>
-      <div className="flex min-h-screen items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-        <main className="flex min-h-screen w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-          <Image
-            className="dark:invert"
-            src="/next.svg"
-            alt="Next.js logo"
-            width={100}
-            height={20}
-            priority
-          />
-          <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-            <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-              Welcome to NZ Landlord
+      <div className="min-h-[calc(100vh-4rem)] flex items-center justify-center">
+        <div className="text-center space-y-8 px-6">
+          {/* Brand Icon */}
+          <div className="mx-auto w-20 h-20 bg-[#00FFBB] rounded-2xl flex items-center justify-center shadow-[0_0_40px_rgba(0,255,187,0.3)]">
+            <Building2 className="w-10 h-10 text-[#0B0E11]" />
+          </div>
+
+          {/* Welcome Text */}
+          <div className="space-y-3">
+            <h1 className="text-3xl font-black text-white tracking-tight">
+              Welcome{profile?.full_name ? `, ${profile.full_name.split(' ')[0]}` : ''}
             </h1>
-            <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-              Your RTA-compliant management tool. If you have existing property data, click below to link it to your account.
+            <p className="text-white/50 text-lg max-w-md mx-auto">
+              Your RTA-compliant property management command center
             </p>
           </div>
 
-          <div className="flex flex-col gap-4 w-full sm:flex-row items-center mt-8">
-            <LinkPropertiesButton />
-
-            <a
-              className="flex h-12 px-8 items-center justify-center rounded-full border border-solid border-black/[.08] transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] text-sm font-bold"
-              href="/rent-tracker"
-            >
-              Continue to Tenants
-            </a>
+          {/* Loading / Redirect State */}
+          <div className="flex items-center justify-center gap-3 text-white/40">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            <span className="text-sm font-medium">Redirecting to dashboard...</span>
           </div>
-        </main>
+
+          {/* Manual Link */}
+          <Link
+            href="/rent-tracker"
+            className="inline-flex items-center gap-2 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-[#00FFBB]/30 rounded-full text-white/70 hover:text-white text-sm font-bold transition-all"
+          >
+            Go to Properties
+            <ArrowRight className="w-4 h-4" />
+          </Link>
+        </div>
       </div>
     </ProtectedRoute>
   );

@@ -75,6 +75,7 @@ interface NoticeRecord {
     subject: string;
     body_html: string;
     status: "draft" | "sent" | "delivered" | "failed";
+    file_path: string | null;
     metadata: Record<string, unknown>;
 }
 
@@ -165,7 +166,35 @@ export async function POST(request: NextRequest) {
             hasPdfAttachment: !!pdfData,
         });
 
-        // Step 3: Prepare notice record for database
+        // Step 4: Upload PDF to Supabase Storage
+        let storagePath: string | null = null;
+
+        if (pdfData) {
+            try {
+                // Generate unique filename with tenant ID and timestamp
+                const timestamp = format(new Date(), "yyyyMMdd-HHmmss");
+                const safeFilename = pdfData.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+                storagePath = `${body.tenantId}/${timestamp}_${safeFilename}`;
+
+                const { error: uploadError } = await supabaseAdmin.storage
+                    .from("notices")
+                    .upload(storagePath, pdfData.pdfBytes, {
+                        contentType: "application/pdf",
+                        upsert: false,
+                    });
+
+                if (uploadError) {
+                    console.error("Storage Upload Error:", uploadError);
+                    // Continue without storage path if upload fails
+                    storagePath = null;
+                }
+            } catch (storageError) {
+                console.error("Storage Error:", storageError);
+                storagePath = null;
+            }
+        }
+
+        // Step 5: Prepare notice record for database
         const noticeRecord: NoticeRecord = {
             tenant_id: body.tenantId,
             property_id: body.propertyId,
@@ -185,13 +214,14 @@ export async function POST(request: NextRequest) {
             subject: emailContent.subject,
             body_html: emailContent.html,
             status: "draft",
+            file_path: storagePath,
             metadata: {
                 region,
                 generatedAt: sentTimestamp,
             },
         };
 
-        // Step 4: Save notice to database FIRST (before sending email)
+        // Step 6: Save notice to database FIRST (before sending email)
         const { data: savedNotice, error: dbError } = await supabaseAdmin
             .from("notices")
             .insert(noticeRecord)
@@ -206,7 +236,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // Step 5: Send email via Resend (with PDF attachment if available)
+        // Step 7: Send email via Resend (with PDF attachment if available)
         let emailResult;
 
         if (pdfData) {
@@ -231,7 +261,7 @@ export async function POST(request: NextRequest) {
             );
         }
 
-        // Step 6: Update notice with email delivery status
+        // Step 8: Update notice with email delivery status
         const emailSentAt = new Date().toISOString();
         const { error: updateError } = await supabaseAdmin
             .from("notices")
@@ -247,7 +277,7 @@ export async function POST(request: NextRequest) {
             console.error("Failed to update notice status:", updateError);
         }
 
-        // Step 7: Return response
+        // Step 9: Return response
         return NextResponse.json({
             success: true,
             notice: {
@@ -255,6 +285,7 @@ export async function POST(request: NextRequest) {
                 noticeType: body.noticeType,
                 isStrike,
                 strikeNumber: body.strikeNumber,
+                filePath: storagePath,
             },
             dates: {
                 sentAt: sentTimestamp,
@@ -271,8 +302,10 @@ export async function POST(request: NextRequest) {
             pdf: pdfData ? {
                 generated: true,
                 filename: pdfData.filename,
+                storagePath: storagePath,
             } : {
                 generated: false,
+                storagePath: null,
                 reason: "PDF generation not available for this notice type or failed",
             },
             legalContext: getLegalContext(body.noticeType, body.strikeNumber),
@@ -366,7 +399,7 @@ function generateCoverNote(params: {
     <div style="background: #f9fafb; padding: 15px; border-radius: 8px; margin: 20px 0;">
         <h3 style="margin-top: 0; color: #374151; font-size: 14px; text-transform: uppercase;">Key Dates</h3>
         <p style="margin: 8px 0;"><strong>Official Service Date:</strong> ${formatDate(officialServiceDate)}</p>
-        ${expiryDate ? `<p style="margin: 8px 0;"><strong>Remedy Deadline:</strong> ${formatDate(expiryDate)}</p>` : ""}
+        ${expiryDate ? `<p style="margin: 8px 0;"><strong>Remedy Deadline:</strong> ${formatDate(expiryDate)} <span style="color: #6b7280;">(by 11:59 PM)</span></p>` : ""}
     </div>
 
     <p>If you have any questions regarding this notice, please contact your landlord or property manager.</p>
@@ -710,10 +743,10 @@ function generateRemedyNoticeHtml(params: {
         <div style="background: #fef2f2; border-left: 4px solid #dc2626; padding: 15px; margin: 20px 0;">
             <h3 style="margin-top: 0; color: #991b1b;">Important Dates</h3>
             <p style="margin: 5px 0;"><strong>Official Service Date:</strong> ${officialServiceDate}</p>
-            <p style="margin: 5px 0;"><strong>Remedy Deadline:</strong> ${expiryDate}</p>
+            <p style="margin: 5px 0;"><strong>Remedy Deadline:</strong> ${expiryDate} <span style="color: #6b7280;">(by 11:59 PM)</span></p>
         </div>
 
-        <p>If the breach is not remedied by the deadline, the landlord may apply to the Tenancy Tribunal.</p>
+        <p>If the breach is not remedied by 11:59 PM on the deadline, the landlord may apply to the Tenancy Tribunal.</p>
 
         <div style="font-size: 12px; color: #6b7280; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e5e7eb;">
             <p>For information about your rights, visit <a href="https://www.tenancy.govt.nz" style="color: #2563eb;">tenancy.govt.nz</a></p>

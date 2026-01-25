@@ -3,15 +3,17 @@
 import { useState } from "react"
 import { Property, RentPayment } from "@/types"
 import { TenantCard } from "./TenantCard"
+import { StatusBadge } from "@/components/ui/StatusBadge"
 import { cn } from "@/lib/utils"
 import { ChevronDown, Plus } from "lucide-react"
-import { isBefore, isSameDay, parseISO, startOfDay } from "date-fns"
+import type { RentalLogicResult } from "@/hooks/useRentalLogic"
+import { getKiwiStatus, type KiwiStatus } from "@/lib/status-engine"
 
 interface PropertyCardProps {
     property: Property;
     payments: RentPayment[];
-    tenantStates: Record<string, { isUnpaid: boolean; totalArrears: number }>;
-    onRecordPayment: (tenantId: string, amount: number) => Promise<void>;
+    tenantLegalStatuses: Record<string, RentalLogicResult>;
+    onRecordPayment: (tenantId: string, amount: number, date: string) => Promise<void>;
     onManageTenant: (tenantId: string) => void;
     onDeleteTenant: (tenantId: string) => void;
     onAddTenant: (propertyId: string) => void;
@@ -22,79 +24,92 @@ interface PropertyCardProps {
 export function PropertyCard({
     property,
     payments,
-    tenantStates,
+    tenantLegalStatuses,
     onRecordPayment,
     onManageTenant,
-    onDeleteTenant,
     onAddTenant,
-    onDeleteProperty,
-    testDate
 }: PropertyCardProps) {
     const [isExpanded, setIsExpanded] = useState(true);
 
-    const getPropertyStatus = () => {
-        if (property.tenants.length === 0) return { color: "slate", text: "No Tenants", isOverdue: false };
+    // Determine property-level status from legal statuses
+    // CRITICAL: Use getKiwiStatus for perfect synchronization with TenantCard
+    let mostCriticalStatus: KiwiStatus = getKiwiStatus(0, 0, 0, 0); // Default to Safe
 
-        let hasUnpaid = false;
-        property.tenants.forEach(tenant => {
-            const state = tenantStates[tenant.id];
-            if (state?.isUnpaid) hasUnpaid = true;
-        });
+    property.tenants.forEach(tenant => {
+        const legalStatus = tenantLegalStatuses[tenant.id];
+        if (!legalStatus) return;
 
-        return {
-            color: hasUnpaid ? "rose" : "emerald",
-            text: hasUnpaid ? "Unpaid Arrears" : "All Paid",
-            isOverdue: hasUnpaid
+        const tenantStatus = getKiwiStatus(
+            legalStatus.daysOverdue,
+            legalStatus.workingDaysOverdue,
+            legalStatus.totalBalanceDue,
+            legalStatus.activeStrikeCount || 0
+        );
+
+        // Escalate to most critical severity found (4-Phase Visual Escalation)
+        const severityPriority: Record<string, number> = {
+            'critical': 4,   // Phase 4: Termination Eligible (Red)
+            'warning': 3,    // Phase 3: Strike Warning (Solid Amber)
+            'caution': 2,    // Phase 2: Caution (Glowing Amber)
+            'safe': 1        // Phase 1: All Good (Green)
         };
-    };
 
-    const status = getPropertyStatus();
+        if (severityPriority[tenantStatus.severity] > severityPriority[mostCriticalStatus.severity]) {
+            mostCriticalStatus = tenantStatus;
+        }
+    });
+
+    const status = mostCriticalStatus.severity;
+    const text = mostCriticalStatus.label.toUpperCase();
+
+    // Parse address for street and suburb
+    const addressParts = property.address.split(',');
+    const streetAddress = addressParts[0]?.trim() || property.address;
+    const suburb = property.region || addressParts[1]?.trim() || '';
 
     return (
         <div className={cn(
-            "relative bg-white rounded-[2.5rem] p-8 border border-[#E1E3E5] transition-all duration-500 mb-8 font-sans",
-            status.isOverdue
-                ? "hover:shadow-[0_20px_50px_-12px_rgba(229,28,0,0.15)] hover:border-[#FAD4D4]"
-                : "hover:shadow-[0_20px_50px_-12px_rgba(0,128,96,0.1)] hover:border-[#B7F5D0]"
+            // Glass Card Base - Neon Dark Theme
+            "relative rounded-[2rem] p-6 transition-all duration-300 font-sans h-fit",
+            "bg-white/5 backdrop-blur-xl border border-white/10",
+            // Hover state for grid layout
+            "hover:border-white/20 hover:bg-white/[0.07]"
         )}>
+            {/* Header */}
             <div className="flex justify-between items-start mb-8">
                 <div onClick={() => setIsExpanded(!isExpanded)} className="cursor-pointer group">
-                    <h3 className="text-2xl font-black text-[#1A1C1D] tracking-tighter flex items-center gap-3">
-                        {property.address}
-                        <ChevronDown className={cn("w-5 h-5 text-slate-300 transition-transform", isExpanded && "rotate-180")} />
+                    {/* Address - Bold White, italic */}
+                    <h3 className="text-lg font-black italic text-white tracking-tighter flex items-center gap-3">
+                        {streetAddress}
+                        <ChevronDown className={cn(
+                            "w-5 h-5 text-white/30 transition-transform group-hover:text-white/60",
+                            isExpanded && "rotate-180"
+                        )} />
                     </h3>
-                    <p className="text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] mt-1.5">Portfolio • {property.tenants.length} Active</p>
+                    {/* Suburb - small, muted, uppercase */}
+                    <p className="text-[11px] font-bold text-white/40 uppercase tracking-widest mt-1">
+                        {suburb}
+                    </p>
                 </div>
 
-                <div className={cn(
-                    "flex items-center gap-2.5 px-4 py-2 rounded-full border transition-all",
-                    status.isOverdue ? "bg-[#FFF1F0] border-[#FAD4D4]" : "bg-[#E3FBE3] border-[#B7F5D0]"
-                )}>
-                    <div className={cn(
-                        "w-2.5 h-2.5 rounded-full",
-                        status.isOverdue ? "bg-[#E51C00] animate-pulse shadow-[0_0_8px_rgba(229,28,0,0.4)]" : "bg-[#008060]"
-                    )} />
-                    <span className={cn(
-                        "text-[10px] font-black uppercase tracking-widest",
-                        status.isOverdue ? "text-[#E51C00]" : "text-[#008060]"
-                    )}>
-                        {status.text}
-                    </span>
-                </div>
+                <StatusBadge
+                    status={status as any}
+                    text={text}
+                />
             </div>
 
+            {/* Expanded Content */}
             {isExpanded && (
-                <div className="space-y-6 animate-in fade-in slide-in-from-top-2 duration-500">
+                <div className="space-y-6 animate-in slide-in-from-top-4 duration-500 ease-out">
                     {property.tenants.map(tenant => {
-                        const state = tenantStates[tenant.id] || { isUnpaid: false, totalArrears: 0 };
+                        const legalStatus = tenantLegalStatuses[tenant.id];
                         const allTenantPayments = payments.filter(p => p.tenantId === tenant.id);
 
                         return (
                             <TenantCard
                                 key={tenant.id}
                                 tenant={tenant}
-                                isUnpaid={state.isUnpaid}
-                                totalArrears={state.totalArrears}
+                                legalStatus={legalStatus}
                                 payments={allTenantPayments}
                                 propertyId={property.id}
                                 onRecordPayment={onRecordPayment}
@@ -103,12 +118,16 @@ export function PropertyCard({
                         );
                     })}
 
+                    {/* Add Tenant Button */}
                     <button
                         onClick={() => onAddTenant(property.id)}
-                        className="w-full h-14 border-2 border-dashed border-[#EDEEEF] rounded-2xl hover:border-emerald-200 hover:bg-emerald-50/30 transition-all flex items-center justify-center gap-3 text-gray-400 hover:text-emerald-600 font-black text-xs uppercase tracking-widest"
+                        className={cn(
+                            "w-full h-14 border-2 border-dashed border-gray-200 rounded-2xl hover:border-safe-green/30 hover:bg-safe-bg/30 transition-all flex items-center justify-center gap-3 text-gray-400 hover:text-safe-green font-black text-xs uppercase tracking-widest",
+                            property.tenants.length === 0 && "mt-0 bg-gray-50"
+                        )}
                     >
                         <Plus className="w-4 h-4" />
-                        Add New Tenant
+                        {property.tenants.length === 0 ? "Add your first tenant" : "Add New Tenant"}
                     </button>
                 </div>
             )}

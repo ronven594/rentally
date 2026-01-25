@@ -29,17 +29,18 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased min-h-screen bg-[#f7f9fa]`}
+        className={`${geistSans.variable} ${geistMono.variable} antialiased min-h-screen bg-[#0B0E11]`}
       >
         <AuthProvider>
           <StorageCleanup />
           <Navigation />
-          <main className="md:pl-64 min-h-screen pb-24 md:pb-0">
-            <div className="p-4 md:p-10 max-w-7xl mx-auto">
+          {/* Command Center Layout - Full width with top nav offset */}
+          <main className="min-h-screen pt-16 pb-20 md:pb-8">
+            <div className="w-full">
               {children}
             </div>
           </main>
-          <Toaster position="top-center" richColors />
+          <Toaster position="top-center" richColors theme="dark" />
         </AuthProvider>
       </body>
     </html>

@@ -1,14 +1,18 @@
 export type PaymentStatus = "Paid" | "Late" | "Unpaid" | "Pending" | "Partial";
 
+export type PaymentFrequency = "Weekly" | "Fortnightly" | "Monthly";
+
 export interface Tenant {
     id: string;
     name: string;
     email: string;
     phone?: string;
     rentAmount: number;
-    frequency: "Weekly" | "Fortnightly";
-    rentDueDay: string; // e.g. "Wednesday"
-    startDate?: string;
+    frequency: PaymentFrequency;
+    rentDueDay: string; // e.g. "Wednesday" for weekly/fortnightly, or "1" for monthly (day of month)
+    startDate?: string; // Lease start date (when tenant moved in)
+    trackingStartDate?: string; // When we started tracking this tenant in the app (YYYY-MM-DD)
+    openingArrears?: number; // Any existing debt when we started tracking (defaults to 0)
     weekly_rent?: number;
     tenant_address?: string;
     region?: "Wellington" | "Auckland" | "Nelson" | "Taranaki" | "Otago" | "Southland" | "Hawke's Bay" | "Canterbury";

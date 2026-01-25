@@ -28,15 +28,15 @@ export function TribunalFilingAlert({ thirdNoticeServiceDate, testDate }: Tribun
 
     // Dynamic Styling Logic 
     // Green > 14 days | Amber 7-14 days | Red < 7 days
-    let colorClass = "bg-emerald-50 border-emerald-100 text-emerald-800";
-    let iconClass = "text-emerald-500";
-    let progressColor = "bg-emerald-500";
+    let colorClass = "bg-safe-bg border-safe-green/20 text-safe-green";
+    let iconClass = "text-safe-green";
+    let progressColor = "bg-safe-green";
     let statusText = "Eligible for Filing";
 
     if (daysRemaining < 7) {
-        colorClass = "bg-rose-50 border-rose-100 text-rose-800 animate-pulse";
-        iconClass = "text-rose-500";
-        progressColor = "bg-rose-500";
+        colorClass = "bg-overdue-bg border-overdue-red/20 text-overdue-red animate-pulse";
+        iconClass = "text-overdue-red";
+        progressColor = "bg-overdue-red";
         statusText = "CRITICAL DEADLINE";
     } else if (daysRemaining <= 14) {
         colorClass = "bg-amber-50 border-amber-100 text-amber-800";
@@ -47,7 +47,7 @@ export function TribunalFilingAlert({ thirdNoticeServiceDate, testDate }: Tribun
 
     if (isOverdue) {
         return (
-            <div className="bg-slate-900 border border-slate-800 rounded-[28px] p-6 text-white flex items-center gap-5 shadow-2xl">
+            <div className="bg-nav-black border border-slate-800 rounded-[28px] p-6 text-white flex items-center gap-5 shadow-2xl">
                 <div className="w-12 h-12 rounded-2xl bg-slate-800 flex items-center justify-center text-rose-500 shrink-0 shadow-inner">
                     <AlertTriangle className="w-6 h-6" />
                 </div>
@@ -77,7 +77,7 @@ export function TribunalFilingAlert({ thirdNoticeServiceDate, testDate }: Tribun
             <div className="flex items-start gap-5 relative z-10">
                 <div className={cn(
                     "w-14 h-14 rounded-2xl flex items-center justify-center shadow-inner shrink-0",
-                    daysRemaining < 7 ? "bg-rose-100/50" : daysRemaining <= 14 ? "bg-amber-100/50" : "bg-emerald-100/50"
+                    daysRemaining < 7 ? "bg-overdue-bg" : daysRemaining <= 14 ? "bg-amber-100/50" : "bg-safe-bg"
                 )}>
                     {daysRemaining < 7 ? (
                         <AlertTriangle className={cn("w-7 h-7", iconClass)} />

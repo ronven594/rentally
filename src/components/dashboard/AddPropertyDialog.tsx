@@ -94,7 +94,7 @@ export function AddPropertyDialog({ open, onOpenChange, onAdd }: AddPropertyDial
         <Dialog open={open} onOpenChange={onOpenChange}>
             <DialogContent className="sm:max-w-md bg-white border-0 shadow-lg rounded-3xl p-6">
                 <DialogHeader className="mb-4">
-                    <DialogTitle className="text-xl font-bold text-slate-900 tracking-tight">Add New Property</DialogTitle>
+                    <DialogTitle className="text-xl font-black italic text-nav-black tracking-tight">Add New Property</DialogTitle>
                 </DialogHeader>
                 <form onSubmit={handleSubmit} className="space-y-6">
                     <div className="space-y-2">
@@ -161,7 +161,7 @@ export function AddPropertyDialog({ open, onOpenChange, onAdd }: AddPropertyDial
                         <Button
                             type="submit"
                             disabled={loading}
-                            className="h-12 px-8 bg-slate-900 hover:bg-slate-800 text-white font-bold rounded-xl transition-all shadow-md active:scale-95 disabled:opacity-50"
+                            className="h-12 px-8 bg-safe-green hover:bg-safe-green/90 text-white font-black rounded-xl transition-all shadow-lg shadow-safe-green/20 active:scale-95 disabled:opacity-50"
                         >
                             {loading ? (
                                 <>

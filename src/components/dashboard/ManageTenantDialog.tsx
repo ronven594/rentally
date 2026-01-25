@@ -21,6 +21,7 @@ import { Tenant } from "@/types"
 import { User, Trash2, CheckCircle2, Mail, Phone, Calendar } from "lucide-react"
 import { toast } from "sonner"
 import { useMediaQuery } from "@/hooks/use-media-query"
+import { ConfirmationDialog } from "./ConfirmationDialog"
 
 interface ManageTenantDialogProps {
     open: boolean;
@@ -43,6 +44,7 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
     const [rentDueDay, setRentDueDay] = useState("Wednesday");
     const [address, setAddress] = useState("");
     const [leaseStartDate, setLeaseStartDate] = useState("");
+    const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
     useEffect(() => {
         if (open && tenant) {
@@ -211,12 +213,7 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
 
             <div className="pt-6 border-t border-slate-100 flex items-center justify-between gap-4">
                 <button
-                    onClick={() => {
-                        if (confirm(`Are you sure you want to remove ${tenant.name}?`)) {
-                            onDelete(tenant.id);
-                            onOpenChange(false);
-                        }
-                    }}
+                    onClick={() => setShowDeleteConfirm(true)}
                     className="flex items-center gap-2 text-rose-500 hover:text-rose-600 transition-colors group px-2"
                 >
                     <div className="w-8 h-8 rounded-full bg-rose-50 flex items-center justify-center group-hover:bg-rose-100 transition-colors">
@@ -225,7 +222,7 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
                     <span className="text-xs font-bold uppercase tracking-wider">Remove Tenant</span>
                 </button>
 
-                <Button onClick={handleSave} className="flex-1 h-11 bg-slate-900 text-white hover:bg-black rounded-xl font-bold shadow-lg shadow-slate-100 transition-all active:scale-[0.98]">
+                <Button onClick={handleSave} className="flex-1 h-11 bg-safe-green text-white hover:bg-safe-green/90 rounded-xl font-black shadow-lg shadow-safe-green/20 transition-all active:scale-[0.98]">
                     Save Changes
                 </Button>
             </div>
@@ -234,26 +231,58 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
 
     if (isDesktop) {
         return (
-            <Dialog open={open} onOpenChange={onOpenChange}>
-                <DialogContent className="sm:max-w-[480px] bg-white border-none shadow-2xl rounded-3xl p-8">
-                    <DialogHeader className="mb-6">
-                        <DialogTitle className="text-2xl font-black text-slate-900">Manage {tenant.name}</DialogTitle>
-                    </DialogHeader>
-                    {content}
-                </DialogContent>
-            </Dialog>
+            <>
+                <Dialog open={open} onOpenChange={onOpenChange}>
+                    <DialogContent className="sm:max-w-[480px] bg-white border-none shadow-2xl rounded-3xl p-8">
+                        <DialogHeader className="mb-6">
+                            <DialogTitle className="text-2xl font-black italic text-nav-black">Manage {tenant.name}</DialogTitle>
+                        </DialogHeader>
+                        {content}
+                    </DialogContent>
+                </Dialog>
+
+                <ConfirmationDialog
+                    open={showDeleteConfirm}
+                    onOpenChange={setShowDeleteConfirm}
+                    title="Remove Tenant?"
+                    description={`This will permanently delete ${tenant.name} and all associated rent records. This action cannot be undone.`}
+                    confirmText="Remove"
+                    variant="destructive"
+                    onConfirm={() => {
+                        onDelete(tenant.id);
+                        setShowDeleteConfirm(false);
+                        onOpenChange(false);
+                    }}
+                />
+            </>
         );
     }
 
     return (
-        <Sheet open={open} onOpenChange={onOpenChange}>
-            <SheetContent side="bottom" className="bg-white rounded-t-[32px] p-8 border-none outline-none ring-0 focus:ring-0">
-                <div className="w-12 h-1.5 bg-slate-200 rounded-full mx-auto mb-8" />
-                <SheetHeader className="mb-6">
-                    <SheetTitle className="text-2xl font-black text-slate-900 text-left">Manage {tenant.name}</SheetTitle>
-                </SheetHeader>
-                {content}
-            </SheetContent>
-        </Sheet>
+        <>
+            <Sheet open={open} onOpenChange={onOpenChange}>
+                <SheetContent side="bottom" className="bg-white rounded-t-[32px] p-8 border-none outline-none ring-0 focus:ring-0">
+                    <div className="w-12 h-1.5 bg-slate-200 rounded-full mx-auto mb-8" />
+                    <SheetHeader className="mb-6">
+                        <SheetTitle className="text-2xl font-black italic text-nav-black text-left">Manage {tenant.name}</SheetTitle>
+                    </SheetHeader>
+                    {content}
+                </SheetContent>
+            </Sheet>
+
+            <ConfirmationDialog
+                open={showDeleteConfirm}
+                onOpenChange={setShowDeleteConfirm}
+                title="Remove Tenant?"
+                description={`This will permanently delete ${tenant.name} and all associated rent records. This action cannot be undone.`}
+                confirmText="Remove"
+                variant="destructive"
+                onConfirm={() => {
+                    onDelete(tenant.id);
+                    setShowDeleteConfirm(false);
+                    onOpenChange(false);
+                }}
+            />
+        </>
     );
 }

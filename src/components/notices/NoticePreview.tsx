@@ -86,6 +86,7 @@ export function NoticePreview({
     const [sending, setSending] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [sentNoticeId, setSentNoticeId] = useState<string | null>(null);
+    const [showConfirmationModal, setShowConfirmationModal] = useState(false);
 
     // Calculate preview dates
     const previewSentTime = new Date().toISOString();
@@ -285,6 +286,13 @@ export function NoticePreview({
                             )}
                         </div>
                     </div>
+                    {currentStrikeCount > 0 && currentStrikeCount < 3 && daysRemainingInWindow !== null && (
+                        <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+                            <p className="text-xs text-blue-700">
+                                <strong>Window Reset:</strong> If no new strikes are issued, the strike window will reset in {daysRemainingInWindow} days (on {strikeInfo?.window_expiry_date ? format(parseISO(strikeInfo.window_expiry_date), 'd MMM yyyy') : 'N/A'}). After this date, any new strikes will start a fresh 90-day window.
+                            </p>
+                        </div>
+                    )}
                 </div>
             )}
 
@@ -318,7 +326,7 @@ export function NoticePreview({
                             title="Remedy Deadline"
                             date={format(parseISO(previewExpiryDate), "EEEE, d MMMM yyyy")}
                             status="deadline"
-                            description="14-day remedy period expires"
+                            description="Tenant must remedy by 11:59 PM on this date"
                         />
                     )}
                     {previewTribunalDeadline && (
@@ -418,13 +426,13 @@ export function NoticePreview({
                         </Button>
                     )}
                     <Button
-                        onClick={handleSendNotice}
+                        onClick={() => setShowConfirmationModal(true)}
                         disabled={sending || !!sentNoticeId}
                         className={`${
                             isAboutToBeThirdStrike
-                                ? "bg-red-600 hover:bg-red-700"
-                                : "bg-slate-900 hover:bg-slate-800"
-                        } text-white font-bold`}
+                                ? "bg-overdue-red hover:bg-overdue-red/90"
+                                : "bg-nav-black hover:bg-black"
+                        } text-white font-black`}
                     >
                         {sending ? (
                             <>
@@ -439,12 +447,25 @@ export function NoticePreview({
                         ) : (
                             <>
                                 <Send className="w-4 h-4 mr-2" />
-                                Send Notice
+                                Approve & Send
                             </>
                         )}
                     </Button>
                 </div>
             </div>
+
+            {/* Legal Confirmation Modal */}
+            <LegalConfirmationModal
+                isOpen={showConfirmationModal}
+                onClose={() => setShowConfirmationModal(false)}
+                onConfirm={() => {
+                    setShowConfirmationModal(false);
+                    handleSendNotice();
+                }}
+                isLoading={sending}
+                noticeType={getNoticeTitle(noticeType, effectiveStrikeNumber)}
+                tenantName={tenantName}
+            />
         </div>
     );
 }

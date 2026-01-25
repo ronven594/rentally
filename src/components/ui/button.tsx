@@ -19,6 +19,17 @@ const buttonVariants = cva(
         ghost:
           "hover:bg-accent hover:text-accent-foreground dark:hover:bg-accent/50",
         link: "text-primary underline-offset-4 hover:underline",
+        // Brand variants - Neon-Dark Theme
+        brand:
+          "bg-[#0B0E11] text-white font-black uppercase tracking-widest shadow-lg shadow-black/30 hover:bg-black active:scale-95 border border-white/10",
+        "brand-success":
+          "bg-[#00FFBB]/10 border border-[#00FFBB]/30 text-[#00FFBB] font-black uppercase tracking-widest hover:bg-[#00FFBB]/20 hover:shadow-[0_0_15px_rgba(0,255,187,0.3)] backdrop-blur-sm",
+        "brand-secondary":
+          "bg-white/5 border border-white/10 text-white/70 font-bold uppercase tracking-widest hover:border-white/20 hover:text-white backdrop-blur-sm",
+        "brand-danger":
+          "bg-[#FF3B3B] text-white font-black uppercase tracking-widest shadow-[0_0_15px_rgba(255,59,59,0.4)] hover:shadow-[0_0_20px_rgba(255,59,59,0.6)] active:scale-95",
+        "brand-warning":
+          "bg-[#FFB800] text-[#0B0E11] font-black uppercase tracking-widest shadow-[0_0_12px_rgba(255,184,0,0.3)] hover:shadow-[0_0_18px_rgba(255,184,0,0.5)] active:scale-95",
       },
       size: {
         default: "h-9 px-4 py-2 has-[>svg]:px-3",
@@ -27,6 +38,8 @@ const buttonVariants = cva(
         icon: "size-9",
         "icon-sm": "size-8",
         "icon-lg": "size-10",
+        // Brand size - tall pill buttons (synced with btn-black utility)
+        brand: "py-4 px-6 text-[11px] font-black uppercase tracking-widest rounded-full",
       },
     },
     defaultVariants: {
