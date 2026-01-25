@@ -5,6 +5,7 @@ import { Navigation } from "@/components/layout/Navigation";
 import { StorageCleanup } from "@/components/layout/StorageCleanup";
 import { Toaster } from "sonner";
 import { AuthProvider } from "@/contexts/AuthContext";
+import { LedgerSyncManager } from '@/components/LedgerSyncManager';
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -32,7 +33,7 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased min-h-screen bg-[#0B0E11]`}
       >
         <AuthProvider>
-          <StorageCleanup />
+          <LedgerSyncManager />  <StorageCleanup />
           <Navigation />
           {/* Command Center Layout - Full width with top nav offset */}
           <main className="min-h-screen pt-16 pb-20 md:pb-8">

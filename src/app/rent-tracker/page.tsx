@@ -8,7 +8,6 @@ import { ManageTenantDialog } from "@/components/dashboard/ManageTenantDialog"
 import { ConfirmationDialog } from "@/components/dashboard/ConfirmationDialog"
 import { Property, Tenant, RentPayment, PaymentStatus, PaymentFrequency, PaymentHistoryEntry } from "@/types"
 import { parseISO, format, addDays, addMonths, startOfDay } from "date-fns"
-import { calculateDueDates } from "@/lib/payment-automation"
 import { logToEvidenceLedger, EVENT_TYPES, CATEGORIES } from "@/services/evidenceLedger"
 import { Plus, Building2, Users, AlertCircle, Loader2 } from "lucide-react"
 import { UpcomingObligations } from "@/components/dashboard/UpcomingObligations"
@@ -266,15 +265,80 @@ export default function RentTrackerPage() {
                     });
 
                     if (!mostRecentPayment) {
-                        // First payment generation: use TRACKING START DATE as start point
-                        const generationStartDate = parseISO(effectiveTrackingStart);
-                        dueDates = calculateDueDates(
-                            tenant.frequency,
-                            tenant.rentDueDay,
-                            testDate || new Date(),
-                            generationStartDate
-                        );
-                        console.log(`🆕 First payment generation for ${tenant.name} from tracking start ${effectiveTrackingStart}:`, dueDates);
+                        // =====================================================================
+                        // FIX: Debt Time Machine Bug - NO Historical Backfill
+                        // =====================================================================
+                        // CRITICAL: The watchdog should NEVER generate historical debt records
+                        //
+                        // BEFORE FIX (Time Machine):
+                        //   - User creates tenant on Jan 26 with tracking start Dec 1
+                        //   - Opening arrears: $1000 (or $0)
+                        //   - Watchdog generates: Dec 1, Dec 30, Jan 1, Jan 26 (historical backfill)
+                        //   - Result: Duplicate records OR debt appearing for paid periods ❌
+                        //
+                        // AFTER FIX (Proactive Only):
+                        //   - User creates tenant on Jan 26 with tracking start Dec 1
+                        //   - Opening arrears: $1000 → AddTenantDialog creates Dec 1 record
+                        //   - Watchdog finds Dec 1 record exists → skips this branch
+                        //   - Opening arrears: $0 → No records exist
+                        //   - Watchdog generates ONLY next upcoming due date after today (Feb 1)
+                        //   - Result: Clean ledger, no historical backfill ✅
+                        //
+                        // GOAL:
+                        //   - $0 behind = Green status, no back-dated debts
+                        //   - $x behind = Single opening arrears record, no backfill
+                        // =====================================================================
+
+                        console.log(`🆕 NO EXISTING PAYMENTS for ${tenant.name} - Generating NEXT upcoming due date only (no historical backfill)`);
+
+                        // Don't backfill from tracking start date!
+                        // Instead, find the NEXT due date after today
+                        const todayDate = testDate || new Date();
+                        const todayNormalized = startOfDay(todayDate);
+
+                        let nextDate: Date;
+
+                        if (tenant.frequency === 'Monthly') {
+                            // For Monthly: Find next occurrence of the day-of-month AFTER today
+                            const dayOfMonth = parseInt(tenant.rentDueDay, 10) || 1;
+                            const currentMonth = todayNormalized.getMonth();
+                            const currentYear = todayNormalized.getFullYear();
+
+                            // Try current month first
+                            const lastDayOfMonth = new Date(currentYear, currentMonth + 1, 0).getDate();
+                            const effectiveDay = Math.min(dayOfMonth, lastDayOfMonth);
+                            nextDate = new Date(currentYear, currentMonth, effectiveDay);
+
+                            // If that's on or before today, move to next month
+                            if (startOfDay(nextDate) <= todayNormalized) {
+                                const nextMonth = addMonths(nextDate, 1);
+                                const nextMonthLastDay = new Date(nextMonth.getFullYear(), nextMonth.getMonth() + 1, 0).getDate();
+                                const nextMonthEffectiveDay = Math.min(dayOfMonth, nextMonthLastDay);
+                                nextDate = new Date(nextMonth.getFullYear(), nextMonth.getMonth(), nextMonthEffectiveDay);
+                            }
+                        } else {
+                            // For Weekly/Fortnightly: Find next occurrence of the day-of-week AFTER today
+                            const daysToAdd = tenant.frequency === 'Fortnightly' ? 14 : 7;
+
+                            // Start from tracking start date and advance until we're in the future
+                            const trackingStart = parseISO(effectiveTrackingStart);
+                            nextDate = new Date(trackingStart);
+
+                            // Advance in chunks until we pass today
+                            while (startOfDay(nextDate) <= todayNormalized) {
+                                nextDate = addDays(nextDate, daysToAdd);
+                            }
+                        }
+
+                        dueDates = [format(nextDate, 'yyyy-MM-dd')];
+
+                        console.log(`📅 NEXT DUE DATE for ${tenant.name}:`, {
+                            today: format(todayNormalized, 'yyyy-MM-dd'),
+                            nextDueDate: dueDates[0],
+                            frequency: tenant.frequency,
+                            rentDueDay: tenant.rentDueDay,
+                            explanation: 'Generating ONLY next upcoming due date (no historical backfill)'
+                        });
                     } else {
                         const todayDate = testDate || new Date();
                         const todayNormalized = startOfDay(todayDate);
@@ -397,8 +461,22 @@ export default function RentTrackerPage() {
                             snapDescription: 'Using current settings, not old due_date'
                         });
 
-                        // PROACTIVE: Generate ALL missing payments up to TODAY (not waiting for triggers)
-                        // This ensures debt records exist from the moment rent is due
+                        // =====================================================================
+                        // PROACTIVE DEBT GENERATION
+                        // =====================================================================
+                        // Generate ALL missing payments from the last payment record up to TODAY
+                        // This works correctly for both cases:
+                        //   1. $0 behind: No historical records, handled by "!mostRecentPayment" branch
+                        //   2. $x behind: Has historical records (e.g., Dec 1, Dec 8, Dec 15 for 3 weeks behind)
+                        //                 → Continues from last record (Dec 15) to today (Dec 22, Dec 29, etc.)
+                        //
+                        // Example: $600 opening arrears ÷ $200/week = 3 weeks behind
+                        //   - AddTenantDialog creates: Dec 1, Dec 8, Dec 15 (3 historical records)
+                        //   - Watchdog finds mostRecent = Dec 15
+                        //   - Watchdog generates: Dec 22, Dec 29, Jan 5, Jan 12, Jan 19, Jan 26
+                        //   - Total: $1800 (9 weeks × $200) ✅
+                        // =====================================================================
+
                         while (startOfDay(nextDate) <= todayNormalized) {
                             dueDates.push(format(nextDate, 'yyyy-MM-dd'));
 

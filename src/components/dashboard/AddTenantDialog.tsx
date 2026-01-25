@@ -15,7 +15,8 @@ import { Tenant, PaymentFrequency } from "@/types"
 import { User, Mail, Phone, Calendar, Loader2, UserPlus } from "lucide-react"
 import { supabase } from "@/lib/supabaseClient"
 import { toast } from "sonner"
-import { format } from "date-fns"
+import { format, addDays, addWeeks, addMonths, parseISO } from "date-fns"
+import { resolveTenantStatus, applyResolvedStatus } from "@/lib/tenant-status-resolver"
 
 interface AddTenantDialogProps {
     open: boolean;
@@ -115,51 +116,193 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
 
             if (data) {
                 // =====================================================================
-                // FIX: Arrears Amnesia Bug - Materialize Opening Arrears as Ledger Entry
+                // AI STATUS RESOLVER: Smart Payment Generation
                 // =====================================================================
-                // CRITICAL: If tenant has opening arrears, create an Unpaid payment record
-                // This ensures the debt is visible in the ledger, not just metadata
+                // CRITICAL LOGIC:
+                // If user says tenant is "$600 behind", we assume:
+                // - The tenant was PAYING older periods (historical payments)
+                // - They only fell behind on RECENT periods
                 //
-                // BEFORE FIX:
-                //   - User sets $1000 opening arrears on Dec 1
-                //   - System stores it as tenant.opening_arrears field
-                //   - Watchdog generates Dec 30 record ($1000)
-                //   - Total shown: $1000 (missing the Dec 1 debt!) ❌
+                // NEW APPROACH:
+                // 1. Generate ALL payment records from tracking start to today
+                // 2. Insert them all as Unpaid initially
+                // 3. Use AI Resolver to determine which should be marked Paid
+                // 4. Apply the resolved status
                 //
-                // AFTER FIX:
-                //   - User sets $1000 opening arrears on Dec 1
-                //   - System creates Unpaid record for Dec 1 ($1000)
-                //   - System sets tenant.opening_arrears = 0 (to avoid double-counting)
-                //   - Watchdog generates Dec 30 record ($1000)
-                //   - Total shown: $2000 ✅
+                // Example: $600 behind, $400/fortnight, tracking Nov 1, today Jan 26
+                //   - Generate ALL periods: Nov 7, Nov 21, Dec 5, Dec 19, Jan 2, Jan 16
+                //   - Total if all unpaid: $2400
+                //   - But user said only $600 behind
+                //   - Resolver marks Nov 7-Dec 19 as Paid ($1800)
+                //   - Leaves Jan 2-16 as Unpaid ($600)
+                //   - "Overdue since Jan 2" ✅
                 // =====================================================================
 
-                if (finalOpeningBalance > 0 && finalTrackingStartDate) {
-                    console.log('💰 CREATING OPENING ARREARS RECORD:', {
+                if (finalTrackingStartDate) {
+                    const rentAmount = Number(amount);
+                    const today = new Date();
+                    const trackingStart = parseISO(finalTrackingStartDate);
+
+                    console.log('🤖 AI STATUS RESOLVER - Generating payment cycle:', {
                         tenantName: `${firstName} ${lastName}`,
-                        amount: finalOpeningBalance,
-                        dueDate: finalTrackingStartDate,
-                        description: 'Initial debt from tracking start date'
+                        openingBalance: finalOpeningBalance,
+                        rentAmount,
+                        frequency,
+                        trackingStartDate: finalTrackingStartDate,
+                        rentDueDay: effectiveDueDay,
+                        today: format(today, 'yyyy-MM-dd'),
+                        strategy: 'Generate ALL periods from tracking start, then use AI resolver'
                     });
 
-                    const { error: paymentError } = await supabase
-                        .from('payments')
-                        .insert({
-                            tenant_id: data.id,
-                            property_id: propertyId,
-                            due_date: finalTrackingStartDate,
-                            amount: finalOpeningBalance,
-                            status: 'Unpaid',
-                            amount_paid: 0,
-                            paid_date: null
+                    // Generate all due dates from tracking start to today
+                    const allDueDates: Date[] = [];
+                    let currentDueDate: Date;
+
+                    // Find first due date based on frequency
+                    if (frequency === 'Monthly') {
+                        // For Monthly: Find first occurrence of rentDueDay on or after tracking start
+                        const dayOfMonth = parseInt(effectiveDueDay, 10) || 1;
+                        const trackingMonth = trackingStart.getMonth();
+                        const trackingYear = trackingStart.getFullYear();
+
+                        const lastDayOfMonth = new Date(trackingYear, trackingMonth + 1, 0).getDate();
+                        const effectiveDay = Math.min(dayOfMonth, lastDayOfMonth);
+                        currentDueDate = new Date(trackingYear, trackingMonth, effectiveDay);
+
+                        // If that's before tracking start, move to next month
+                        if (currentDueDate < trackingStart) {
+                            const nextMonth = addMonths(currentDueDate, 1);
+                            const nextMonthLastDay = new Date(nextMonth.getFullYear(), nextMonth.getMonth() + 1, 0).getDate();
+                            const nextMonthEffectiveDay = Math.min(dayOfMonth, nextMonthLastDay);
+                            currentDueDate = new Date(nextMonth.getFullYear(), nextMonth.getMonth(), nextMonthEffectiveDay);
+                        }
+                    } else {
+                        // For Weekly/Fortnightly: Find first occurrence of rentDueDay on or after tracking start
+                        // DAYS_OF_WEEK = ["Monday", "Tuesday", ..., "Sunday"]
+                        const targetDayIndex = DAYS_OF_WEEK.indexOf(effectiveDueDay);
+                        const targetJsDay = targetDayIndex === 6 ? 0 : targetDayIndex + 1;
+                        const trackingStartJsDay = trackingStart.getDay();
+
+                        // Calculate days to add to reach target day of week
+                        let daysToAdd = (targetJsDay - trackingStartJsDay + 7) % 7;
+
+                        currentDueDate = addDays(trackingStart, daysToAdd);
+
+                        console.log('📅 Finding first due date for Weekly/Fortnightly:', {
+                            trackingStart: format(trackingStart, 'yyyy-MM-dd (EEEE)'),
+                            targetDay: effectiveDueDay,
+                            daysToAdd,
+                            firstDueDate: format(currentDueDate, 'yyyy-MM-dd (EEEE)')
                         });
+                    }
+
+                    // Generate all due dates up to today
+                    const maxIterations = 520; // Safety limit
+                    let iterations = 0;
+
+                    while (currentDueDate <= today && iterations < maxIterations) {
+                        allDueDates.push(new Date(currentDueDate));
+                        iterations++;
+
+                        // Advance by frequency
+                        if (frequency === 'Weekly') {
+                            currentDueDate = addWeeks(currentDueDate, 1);
+                        } else if (frequency === 'Fortnightly') {
+                            currentDueDate = addWeeks(currentDueDate, 2);
+                        } else if (frequency === 'Monthly') {
+                            const dayOfMonth = parseInt(effectiveDueDay, 10) || 1;
+                            const nextMonth = addMonths(currentDueDate, 1);
+                            const lastDayOfNextMonth = new Date(
+                                nextMonth.getFullYear(),
+                                nextMonth.getMonth() + 1,
+                                0
+                            ).getDate();
+                            const effectiveDay = Math.min(dayOfMonth, lastDayOfNextMonth);
+                            currentDueDate = new Date(
+                                nextMonth.getFullYear(),
+                                nextMonth.getMonth(),
+                                effectiveDay
+                            );
+                        }
+                    }
+
+                    console.log('📅 Generated ALL payment periods:', {
+                        totalPeriods: allDueDates.length,
+                        firstDueDate: allDueDates.length > 0 ? format(allDueDates[0], 'yyyy-MM-dd') : 'None',
+                        lastDueDate: allDueDates.length > 0 ? format(allDueDates[allDueDates.length - 1], 'yyyy-MM-dd') : 'None',
+                        totalPotentialDebt: allDueDates.length * rentAmount
+                    });
+
+                    // =====================================================================
+                    // STEP 1: Create ALL payment records as Unpaid initially
+                    // =====================================================================
+                    const allPaymentRecords = allDueDates.map(dueDate => ({
+                        tenant_id: data.id,
+                        property_id: propertyId,
+                        due_date: format(dueDate, 'yyyy-MM-dd'),
+                        amount: rentAmount,
+                        status: 'Unpaid' as const,
+                        amount_paid: 0,
+                        paid_date: null
+                    }));
+
+                    console.log('📝 Creating ALL payment records initially as Unpaid:', {
+                        totalRecords: allPaymentRecords.length,
+                        totalDebtIfAllUnpaid: allPaymentRecords.length * rentAmount
+                    });
+
+                    const { data: insertedPayments, error: paymentError } = await supabase
+                        .from('payments')
+                        .insert(allPaymentRecords)
+                        .select();
 
                     if (paymentError) {
-                        console.error('⚠️ Failed to create opening arrears record:', paymentError);
-                        // Don't throw - tenant was created successfully, this is just a ledger entry
-                        toast.error('Tenant created but opening arrears record failed. Please add manually.');
+                        console.error('❌ Failed to create payment records:', paymentError);
+                        toast.error('Tenant created but payment records failed. Please add manually.');
+                        return;
+                    }
+
+                    console.log('✅ Payment records created successfully');
+
+                    // =====================================================================
+                    // STEP 2: Use AI Status Resolver to determine which are actually unpaid
+                    // =====================================================================
+                    if (finalOpeningBalance > 0 && insertedPayments && insertedPayments.length > 0) {
+                        console.log('🤖 Running AI Status Resolver...');
+
+                        const resolvedStatus = resolveTenantStatus(
+                            insertedPayments.map(p => ({
+                                id: p.id,
+                                due_date: p.due_date,
+                                amount: p.amount,
+                                status: p.status,
+                                amount_paid: p.amount_paid
+                            })),
+                            {
+                                trackingStartDate: finalTrackingStartDate,
+                                openingBalance: finalOpeningBalance,
+                                rentAmount,
+                                frequency
+                            },
+                            today
+                        );
+
+                        console.log('🎯 Resolver result:', resolvedStatus);
+
+                        // =====================================================================
+                        // STEP 3: Apply the resolved status to the database
+                        // =====================================================================
+                        try {
+                            await applyResolvedStatus(resolvedStatus, supabase);
+                            console.log('✅ AI Status Resolver applied successfully');
+                            toast.success(`${firstName} added with ${resolvedStatus.balance.toFixed(2)} outstanding balance`);
+                        } catch (applyError) {
+                            console.error('❌ Failed to apply resolved status:', applyError);
+                            toast.error('Tenant created but status resolution failed.');
+                        }
                     } else {
-                        console.log('✅ Opening arrears record created successfully');
+                        // No opening balance - tenant is paid up
+                        console.log('✅ No opening balance - all payments left as unpaid for watchdog to manage');
                     }
                 }
 
