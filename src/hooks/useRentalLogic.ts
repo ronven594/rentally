@@ -365,8 +365,32 @@ function calculateFirstMissedDueDate(
     payments: Array<{ dueDate: string; amount: number; amountPaid: number; status: string }>,
     currentDate: Date
 ): string | null {
+    // =========================================================================
+    // DATABASE-DRIVEN APPROACH (Resilient to Setting Changes)
+    // =========================================================================
+    // This function now uses ACTUAL payment records as the source of truth
+    // instead of generating theoretical due dates based on current settings.
+    //
+    // WHY THIS APPROACH:
+    // 1. Frequency-agnostic: Works with mixed Weekly/Fortnightly/Monthly records
+    // 2. Setting-agnostic: Handles rentDueDay changes (30th → 1st)
+    // 3. Audit-trail preserving: Uses historical due_dates as they were recorded
+    // 4. No theoretical date generation: No mismatch between theory and reality
+    //
+    // ALGORITHM:
+    // 1. Take ALL payment records from database (source of truth)
+    // 2. Sort by due_date (oldest first)
+    // 3. Find first record that's unpaid/partial AND before today
+    // 4. Return its actual due_date from the database
+    // =========================================================================
+
     // If missing required data, cannot calculate
     if (!trackingStartDate || !frequency || !rentDueDay) {
+        console.warn('⚠️ calculateFirstMissedDueDate - Missing required data:', {
+            hasTrackingStartDate: !!trackingStartDate,
+            hasFrequency: !!frequency,
+            hasRentDueDay: !!rentDueDay
+        });
         return null;
     }
 
@@ -374,46 +398,26 @@ function calculateFirstMissedDueDate(
     const todayNZ = toZonedTime(currentDate, NZ_TIMEZONE);
     const today = startOfDay(todayNZ);
 
-    // Parse tracking start date
+    // Parse tracking start date for logging purposes
     const trackingStart = startOfDay(toZonedTime(parseISO(trackingStartDate), NZ_TIMEZONE));
 
-    // Find the first due date on or after trackingStartDate
-    let currentDueDate: Date;
+    // DIAGNOSTIC: Log input data for debugging
+    console.log('🔍 calculateFirstMissedDueDate - Database-Driven Approach:', {
+        trackingStartDate,
+        today: format(today, 'yyyy-MM-dd'),
+        currentFrequency: frequency,
+        currentRentDueDay: rentDueDay,
+        paymentRecordCount: payments.length,
+        approachDescription: 'Using actual payment records, not theoretical dates'
+    });
 
-    if (frequency === 'Monthly') {
-        // For monthly: rentDueDay is the day of month (e.g., "1", "15", "28")
-        const dayOfMonth = parseInt(rentDueDay, 10) || 1;
-
-        // Start with tracking start month
-        currentDueDate = new Date(trackingStart.getFullYear(), trackingStart.getMonth(), dayOfMonth);
-
-        // If that date is before tracking start, move to next month
-        if (isBefore(currentDueDate, trackingStart)) {
-            currentDueDate = addMonths(currentDueDate, 1);
-        }
-    } else {
-        // For Weekly/Fortnightly: rentDueDay is day name (e.g., "Wednesday")
-        const targetDayNum = DAY_NAME_TO_NUMBER[rentDueDay];
-
-        if (targetDayNum === undefined) {
-            console.warn(`Unknown rent due day: ${rentDueDay}, defaulting to Wednesday`);
-            currentDueDate = nextDay(trackingStart, 3); // Default to Wednesday
-        } else {
-            // Find the first occurrence of this day on or after trackingStart
-            const currentDayNum = getDay(trackingStart);
-
-            if (currentDayNum === targetDayNum) {
-                // trackingStart IS the due day
-                currentDueDate = trackingStart;
-            } else {
-                // Find next occurrence
-                currentDueDate = nextDay(trackingStart, targetDayNum);
-            }
-        }
-    }
-
-    // Create a map of due dates to payment status for quick lookup
+    // =========================================================================
+    // STEP 1: Process all payment records from database
+    // =========================================================================
+    // Group payments by due_date and calculate paid/owed for each
+    // This handles duplicate records for the same due date
     const paymentsByDueDate = new Map<string, { paid: number; owed: number }>();
+
     payments.forEach(p => {
         const dueDateStr = format(startOfDay(toZonedTime(parseISO(p.dueDate), NZ_TIMEZONE)), 'yyyy-MM-dd');
         const existing = paymentsByDueDate.get(dueDateStr) || { paid: 0, owed: 0 };
@@ -422,36 +426,51 @@ function calculateFirstMissedDueDate(
         paymentsByDueDate.set(dueDateStr, existing);
     });
 
-    // Iterate through due dates from trackingStart until today
-    // Find the FIRST due date that is not fully paid
-    while (isBefore(currentDueDate, today) || isEqual(currentDueDate, today)) {
-        const dueDateStr = format(currentDueDate, 'yyyy-MM-dd');
-        const payment = paymentsByDueDate.get(dueDateStr);
+    console.log('🔍 calculateFirstMissedDueDate - All Payment Records:', {
+        paymentsByDueDateMap: Array.from(paymentsByDueDate.entries()).map(([date, data]) => ({
+            date,
+            owed: data.owed.toFixed(2),
+            paid: data.paid.toFixed(2),
+            status: data.paid >= data.owed - 0.01 ? 'PAID' : data.paid > 0 ? 'PARTIAL' : 'UNPAID',
+            isBeforeToday: isBefore(parseISO(date), today)
+        }))
+    });
 
-        // Check if this due date is unpaid or partially paid
-        if (!payment || payment.paid < payment.owed - 0.01) {
-            // This is the first missed due date!
-            // Only return if it's actually overdue (before today)
-            if (isBefore(currentDueDate, today)) {
-                return dueDateStr;
-            }
-        }
+    // =========================================================================
+    // STEP 2: Find first unpaid/partial record that's before today
+    // =========================================================================
+    // Sort by due_date (oldest first) and find first unpaid/partial that's overdue
+    const sortedDueDates = Array.from(paymentsByDueDate.entries())
+        .sort((a, b) => {
+            const dateA = parseISO(a[0]);
+            const dateB = parseISO(b[0]);
+            return dateA.getTime() - dateB.getTime(); // Oldest first
+        });
 
-        // Advance to next due date
-        switch (frequency) {
-            case 'Weekly':
-                currentDueDate = addWeeks(currentDueDate, 1);
-                break;
-            case 'Fortnightly':
-                currentDueDate = addWeeks(currentDueDate, 2);
-                break;
-            case 'Monthly':
-                currentDueDate = addMonths(currentDueDate, 1);
-                break;
+    for (const [dueDateStr, payment] of sortedDueDates) {
+        const dueDate = parseISO(dueDateStr);
+        const isBeforeToday = isBefore(dueDate, today);
+        const isUnpaidOrPartial = payment.paid < payment.owed - 0.01;
+
+        console.log('🔍 Checking payment record:', {
+            dueDateStr,
+            paid: payment.paid.toFixed(2),
+            owed: payment.owed.toFixed(2),
+            percentPaid: ((payment.paid / payment.owed) * 100).toFixed(1) + '%',
+            isUnpaidOrPartial,
+            isBeforeToday,
+            shouldReturn: isUnpaidOrPartial && isBeforeToday
+        });
+
+        // If this record is unpaid/partial AND before today, this is our answer
+        if (isUnpaidOrPartial && isBeforeToday) {
+            console.log('✅ FOUND FIRST MISSED DUE DATE (Database-Driven):', dueDateStr);
+            return dueDateStr;
         }
     }
 
     // No unpaid due dates found before today
+    console.log('❌ calculateFirstMissedDueDate - No missed due dates found before today');
     return null;
 }
 
@@ -733,6 +752,21 @@ export function calculateRentalLogic(input: UseRentalLogicInput): RentalLogicRes
 
     // Calculate ANCHORED first missed due date (does NOT float with today's date)
     // This is the actual calendar date of the first unpaid rent cycle
+    console.log('🔍 CALLING calculateFirstMissedDueDate with:', {
+        trackingStartDate: input.trackingStartDate,
+        frequency: input.frequency,
+        rentDueDay: input.rentDueDay,
+        ledgerCount: ledger.length,
+        currentDate: format(input.currentDate || new Date(), 'yyyy-MM-dd'),
+        ledgerSummary: ledger.map(l => ({
+            dueDate: l.dueDate,
+            status: l.status,
+            amount: l.amount,
+            amountPaid: l.amountPaid,
+            balance: l.amount - l.amountPaid
+        }))
+    });
+
     const firstMissedDueDate = calculateFirstMissedDueDate(
         input.trackingStartDate,
         input.frequency,
@@ -740,6 +774,11 @@ export function calculateRentalLogic(input: UseRentalLogicInput): RentalLogicRes
         ledger,
         input.currentDate || new Date()
     );
+
+    console.log('🔍 calculateFirstMissedDueDate RETURNED:', {
+        result: firstMissedDueDate,
+        wasNull: firstMissedDueDate === null
+    });
 
     // Calculate missed cycle count (number of rent cycles missed)
     // CRITICAL: If missedCycleCount >= 3, this is a LEGAL EMERGENCY in NZ

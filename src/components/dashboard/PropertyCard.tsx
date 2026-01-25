@@ -36,6 +36,7 @@ export function PropertyCard({
     onManageTenant,
     onAddTenant,
     onDeleteProperty,
+    testDate,
 }: PropertyCardProps) {
     const [isExpanded, setIsExpanded] = useState(true);
 
@@ -208,6 +209,7 @@ export function PropertyCard({
                                 onRecordPayment={onRecordPayment}
                                 onVoidPayment={onVoidPayment}
                                 onSettings={() => onManageTenant(tenant.id)}
+                                testDate={testDate}
                             />
                         );
                     })}

@@ -7,7 +7,7 @@ import { AddPropertyDialog } from "@/components/dashboard/AddPropertyDialog"
 import { ManageTenantDialog } from "@/components/dashboard/ManageTenantDialog"
 import { ConfirmationDialog } from "@/components/dashboard/ConfirmationDialog"
 import { Property, Tenant, RentPayment, PaymentStatus, PaymentFrequency, PaymentHistoryEntry } from "@/types"
-import { differenceInCalendarDays, parseISO, format, addDays, addMonths, startOfDay } from "date-fns"
+import { parseISO, format, addDays, addMonths, startOfDay } from "date-fns"
 import { calculateDueDates } from "@/lib/payment-automation"
 import { logToEvidenceLedger, EVENT_TYPES, CATEGORIES } from "@/services/evidenceLedger"
 import { Plus, Building2, Users, AlertCircle, Loader2 } from "lucide-react"
@@ -36,6 +36,7 @@ export default function RentTrackerPage() {
     const [selectedPropertyId, setSelectedPropertyId] = useState<string | null>(null);
     const [managingTenantId, setManagingTenantId] = useState<string | null>(null);
     const [testDate, setTestDate] = useState<Date | null>(null);
+    const [isSyncingLedger, setIsSyncingLedger] = useState(false);
     const [confirmState, setConfirmState] = useState<{
         open: boolean;
         message: string;
@@ -225,9 +226,10 @@ export default function RentTrackerPage() {
 
                 try {
                     // Fetch existing payments for this tenant FIRST to decide strategy
+                    // CRITICAL: Include paid_date and amount_paid for coverage check
                     const { data: existingPayments, error: fetchError } = await supabase
                         .from('payments')
-                        .select('id, due_date, status')
+                        .select('id, due_date, status, paid_date, amount_paid')
                         .eq('tenant_id', tenant.id);
 
                     if (fetchError) {
@@ -245,12 +247,23 @@ export default function RentTrackerPage() {
                         existingPaymentsInDB: existingPayments,
                     });
 
-                    // Simplified Generation Logic (Only on Day 7)
-                    const tenantPayments = payments.filter(p => p.tenantId === tenant.id)
-                        .sort((a, b) => parseISO(b.dueDate).getTime() - parseISO(a.dueDate).getTime());
+                    // CRITICAL FIX: Use fresh database data, not stale in-memory state
+                    // The in-memory `payments` state might be outdated when testDate changes
+                    // We need to use `existingPayments` from the database query above
+                    const mostRecentPayment = existingPayments && existingPayments.length > 0
+                        ? existingPayments.sort((a, b) => new Date(b.due_date).getTime() - new Date(a.due_date).getTime())[0]
+                        : null;
 
-                    const mostRecentPayment = tenantPayments[0];
                     let dueDates: string[] = [];
+
+                    console.log('🔍 WATCHDOG - Payment Record Check:', {
+                        tenantName: tenant.name,
+                        existingPaymentsInDB: existingPayments?.length || 0,
+                        mostRecentPaymentExists: !!mostRecentPayment,
+                        mostRecentDueDate: mostRecentPayment?.due_date || 'N/A',
+                        willRunFirstGeneration: !mostRecentPayment,
+                        dataSource: 'Fresh from database (not stale state)'
+                    });
 
                     if (!mostRecentPayment) {
                         // First payment generation: use TRACKING START DATE as start point
@@ -264,39 +277,149 @@ export default function RentTrackerPage() {
                         console.log(`🆕 First payment generation for ${tenant.name} from tracking start ${effectiveTrackingStart}:`, dueDates);
                     } else {
                         const todayDate = testDate || new Date();
-                        const daysFromDueDate = differenceInCalendarDays(todayDate, parseISO(mostRecentPayment.dueDate));
+                        const todayNormalized = startOfDay(todayDate);
 
-                        console.log('💰 GENERATION CHECK:', {
+                        console.log('💰 PROACTIVE GENERATION CHECK:', {
                             tenant: tenant.name,
-                            mostRecentDueDate: mostRecentPayment.dueDate,
-                            daysFromDueDate,
-                            status: mostRecentPayment.status
+                            mostRecentDueDate: mostRecentPayment.due_date,
+                            mostRecentStatus: mostRecentPayment.status,
+                            today: format(todayDate, 'yyyy-MM-dd')
                         });
 
-                        // Only generate next if we hit the trigger day (and current is Paid OR we're in test mode)
-                        // Trigger days: Weekly = 7, Fortnightly = 14, Monthly = 28
-                        const triggerDay = tenant.frequency === 'Monthly' ? 28 : tenant.frequency === 'Fortnightly' ? 14 : 7;
-                        const isTestMode = testDate !== null;
-                        const shouldGenerate = isTestMode
-                            ? daysFromDueDate >= triggerDay
-                            : (daysFromDueDate >= triggerDay && mostRecentPayment.status === 'Paid');
+                        // =====================================================================
+                        // COVERAGE-DRIVEN GENERATION (FIX: Cycle Overlap Bug)
+                        // =====================================================================
+                        // CRITICAL: Check if tenant is still covered by previous payments
+                        // Don't generate new debt if tenant has pre-paid coverage extending into future
+                        //
+                        // BEFORE FIX (Date-Driven):
+                        //   - Tenant pays $1050 on Feb 1 debt → paid_date = March 3
+                        //   - March 1 arrives → system generates March 1 Unpaid record
+                        //   - Result: "Current Balance: $1000" even though covered until March 3
+                        //
+                        // AFTER FIX (Coverage-Driven):
+                        //   - Check most recent paid_date across ALL payments
+                        //   - If today <= paid_date, skip generation (tenant still covered)
+                        //   - Only generate if today > paid_date (coverage expired)
+                        //
+                        // GOAL: Respect pre-paid time - $0 balance until coverage expires
+                        // =====================================================================
 
-                        if (shouldGenerate) {
-                            const todayNormalized = startOfDay(todayDate);
+                        // Find most recent paid_date across ALL payments (coverage endpoint)
+                        const allPaidDates = existingPayments
+                            .filter(p => p.paid_date != null)
+                            .map(p => parseISO(p.paid_date!))
+                            .sort((a, b) => b.getTime() - a.getTime());
 
-                            // Generate ALL missing payments up to today, not just the next one
-                            let nextDate = tenant.frequency === 'Monthly'
-                                ? addMonths(parseISO(mostRecentPayment.dueDate), 1)
-                                : addDays(parseISO(mostRecentPayment.dueDate), tenant.frequency === 'Fortnightly' ? 14 : 7);
+                        const mostRecentPaidDate = allPaidDates.length > 0 ? startOfDay(allPaidDates[0]) : null;
 
-                            while (startOfDay(nextDate) <= todayNormalized) {
-                                dueDates.push(format(nextDate, 'yyyy-MM-dd'));
-                                nextDate = tenant.frequency === 'Monthly'
-                                    ? addMonths(nextDate, 1)
-                                    : addDays(nextDate, tenant.frequency === 'Fortnightly' ? 14 : 7);
+                        console.log('🛡️ COVERAGE CHECK:', {
+                            tenant: tenant.name,
+                            mostRecentPaidDate: mostRecentPaidDate ? format(mostRecentPaidDate, 'yyyy-MM-dd') : 'None (no coverage)',
+                            today: format(todayNormalized, 'yyyy-MM-dd'),
+                            isCovered: mostRecentPaidDate ? mostRecentPaidDate >= todayNormalized : false,
+                            coverageStatus: mostRecentPaidDate
+                                ? (mostRecentPaidDate >= todayNormalized
+                                    ? `✅ COVERED - No generation until ${format(addDays(mostRecentPaidDate, 1), 'yyyy-MM-dd')}`
+                                    : `❌ EXPIRED - Coverage ended ${format(mostRecentPaidDate, 'yyyy-MM-dd')}`)
+                                : '⚠️ NO COVERAGE - Will generate based on calendar'
+                        });
+
+                        // COVERAGE GUARD: If tenant is still covered, don't generate new debt
+                        if (mostRecentPaidDate && mostRecentPaidDate >= todayNormalized) {
+                            console.log(`✅ ${tenant.name}: Still covered until ${format(mostRecentPaidDate, 'yyyy-MM-dd')} - Skipping generation`);
+                            continue; // Skip this tenant - they're pre-paid
+                        }
+
+                        // =====================================================================
+                        // PROACTIVE DEBT GENERATION (Coverage has expired or never existed)
+                        // =====================================================================
+                        // Coverage has expired (or tenant has only Unpaid records with no paid_date)
+                        // Generate missing debt records using calendar-based frequency logic
+
+                        // =====================================================================
+                        // CRITICAL FIX: Snap to Current Settings (Frequency & RentDueDay)
+                        // =====================================================================
+                        // Start searching from day after most recent payment
+                        const searchStartDate = addDays(parseISO(mostRecentPayment.due_date), 1);
+
+                        // Use current frequency and rentDueDay to find next due date
+                        let nextDate: Date;
+
+                        if (tenant.frequency === 'Monthly') {
+                            // For Monthly: Find next occurrence of the day-of-month
+                            const dayOfMonth = parseInt(tenant.rentDueDay, 10) || 1;
+                            const searchMonth = searchStartDate.getMonth();
+                            const searchYear = searchStartDate.getFullYear();
+
+                            // Try current month first
+                            const lastDayOfMonth = new Date(searchYear, searchMonth + 1, 0).getDate();
+                            const effectiveDay = Math.min(dayOfMonth, lastDayOfMonth);
+                            nextDate = new Date(searchYear, searchMonth, effectiveDay);
+
+                            // If that's before our search start, move to next month
+                            if (nextDate < searchStartDate) {
+                                const nextMonth = addMonths(nextDate, 1);
+                                const nextMonthLastDay = new Date(nextMonth.getFullYear(), nextMonth.getMonth() + 1, 0).getDate();
+                                const nextMonthEffectiveDay = Math.min(dayOfMonth, nextMonthLastDay);
+                                nextDate = new Date(nextMonth.getFullYear(), nextMonth.getMonth(), nextMonthEffectiveDay);
                             }
+                        } else {
+                            // =====================================================================
+                            // FIX: Frequency Blindness Bug
+                            // =====================================================================
+                            // BEFORE: System found next day-of-week (always 7 days max)
+                            //   - Jan 30 (Thu) → searchStartDate = Jan 31
+                            //   - Next Thursday = Feb 6 (7 days from Jan 30)
+                            //   - Result: Fortnightly tenant gets WEEKLY debt! ❌
+                            //
+                            // AFTER: Use exact cycle length based on frequency
+                            //   - Fortnightly: Jump exactly 14 days
+                            //   - Weekly: Jump exactly 7 days
+                            //   - Result: Jan 30 + 14 days = Feb 13 ✅
+                            // =====================================================================
 
-                            console.log(`📅 Day ${triggerDay}+ reached! Auto-generating ${dueDates.length} payment(s) for ${tenant.name}${isTestMode ? ' (TEST MODE)' : ''}:`, dueDates);
+                            if (tenant.frequency === 'Fortnightly') {
+                                // Fortnightly: Jump exactly 14 days from previous due date
+                                nextDate = addDays(parseISO(mostRecentPayment.due_date), 14);
+                            } else {
+                                // Weekly: Jump exactly 7 days from previous due date
+                                nextDate = addDays(parseISO(mostRecentPayment.due_date), 7);
+                            }
+                        }
+
+                        console.log('📅 SNAP TO CURRENT SETTINGS:', {
+                            tenant: tenant.name,
+                            oldDueDate: mostRecentPayment.due_date,
+                            currentFrequency: tenant.frequency,
+                            currentRentDueDay: tenant.rentDueDay,
+                            nextDateCalculated: format(nextDate, 'yyyy-MM-dd'),
+                            snapDescription: 'Using current settings, not old due_date'
+                        });
+
+                        // PROACTIVE: Generate ALL missing payments up to TODAY (not waiting for triggers)
+                        // This ensures debt records exist from the moment rent is due
+                        while (startOfDay(nextDate) <= todayNormalized) {
+                            dueDates.push(format(nextDate, 'yyyy-MM-dd'));
+
+                            // Advance by the current frequency
+                            if (tenant.frequency === 'Monthly') {
+                                nextDate = addMonths(nextDate, 1);
+                                // Re-apply snap-to-month-end logic
+                                const dayOfMonth = parseInt(tenant.rentDueDay, 10) || 1;
+                                const nextMonthLastDay = new Date(nextDate.getFullYear(), nextDate.getMonth() + 1, 0).getDate();
+                                const effectiveDay = Math.min(dayOfMonth, nextMonthLastDay);
+                                nextDate = new Date(nextDate.getFullYear(), nextDate.getMonth(), effectiveDay);
+                            } else {
+                                // For Weekly/Fortnightly, just add the days
+                                nextDate = addDays(nextDate, tenant.frequency === 'Fortnightly' ? 14 : 7);
+                            }
+                        }
+
+                        if (dueDates.length > 0) {
+                            console.log(`📅 PROACTIVE GENERATION: Auto-generating ${dueDates.length} payment(s) for ${tenant.name} (debt exists from due date):`, dueDates);
+                        } else {
+                            console.log(`✅ ${tenant.name}: All due dates up to today already exist`);
                         }
                     }
 
@@ -491,7 +614,22 @@ export default function RentTrackerPage() {
                 }
             };
 
-            // Apply payment to oldest debts first
+            // PRIORITY 1: Apply payment to opening_arrears FIRST (if any exists)
+            let newOpeningArrears = tenant.openingArrears || 0;
+            if (newOpeningArrears > 0 && remainingPayment > 0) {
+                const amountToApplyToOpeningArrears = Math.min(remainingPayment, newOpeningArrears);
+                newOpeningArrears -= amountToApplyToOpeningArrears;
+                remainingPayment -= amountToApplyToOpeningArrears;
+
+                console.log('💰 OPENING ARREARS REDUCTION:', {
+                    previousOpeningArrears: tenant.openingArrears,
+                    amountApplied: amountToApplyToOpeningArrears,
+                    newOpeningArrears,
+                    remainingPaymentAfterOpeningArrears: remainingPayment
+                });
+            }
+
+            // PRIORITY 2: Apply remaining payment to ledger entries (oldest first)
             for (const payment of unpaidPayments) {
                 if (remainingPayment <= 0.01) break; // Use small epsilon for float safety
 
@@ -522,19 +660,43 @@ export default function RentTrackerPage() {
                     // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
                     paidDate = format(paidUntilDate, 'yyyy-MM-dd');
                 } else {
-                    // Partial payment: advance proportionally by the DELTA only
-                    // Formula: AdditionalDays = (AmountToApply / CycleRentAmount) * CycleDays
+                    // Partial payment: calculate pro-rata coverage from due date
+                    // Formula: PaidUntil = DueDate + (TotalPaid / TotalOwed) * CycleDays
+                    // CRITICAL: Always calculate from due_date based on TOTAL amount paid (not delta)
                     const cycleDays = getCycleDays(tenant.frequency);
-                    const additionalCoverageRatio = amountToApply / payment.amount; // Only the NEW payment
-                    const additionalDays = additionalCoverageRatio * cycleDays;
+                    const coverageRatio = newAmountPaid / payment.amount; // TOTAL paid so far
+                    const daysOfCoverage = coverageRatio * cycleDays;
+
+                    console.log('📊 PARTIAL PAYMENT - Pro-rata calculation:', {
+                        dueDate: payment.due_date,
+                        totalPaid: newAmountPaid,
+                        totalOwed: payment.amount,
+                        coverageRatio: coverageRatio.toFixed(4),
+                        cycleDays,
+                        daysOfCoverage: Math.round(daysOfCoverage),
+                        formula: `${payment.due_date} + ${Math.round(daysOfCoverage)} days`
+                    });
 
                     // CRITICAL: Use Math.round() to minimize rounding error accumulation
-                    // Start from CURRENT paid_date (or due_date if first payment)
-                    const startDate = payment.paid_date ? parseISO(payment.paid_date) : parseISO(payment.due_date);
-                    const paidUntilDate = addDays(startDate, Math.round(additionalDays));
+                    // Always calculate from due_date to ensure consistency
+                    const paidUntilDate = addDays(parseISO(payment.due_date), Math.round(daysOfCoverage));
                     // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
                     paidDate = format(paidUntilDate, 'yyyy-MM-dd');
                 }
+
+                // VERIFICATION POINT 1: After delta math is performed
+                console.log('💰 PAYMENT RECONCILIATION - Delta Math Complete:', {
+                    paymentId: payment.id,
+                    dueDate: payment.due_date,
+                    frequency: tenant.frequency,
+                    cycleDays: getCycleDays(tenant.frequency),
+                    amountToApply,
+                    totalAmount: payment.amount,
+                    isFullyPaid,
+                    calculatedPaidDate: paidDate,
+                    previousPaidDate: payment.paid_date,
+                    startDate: payment.paid_date || payment.due_date
+                });
 
                 console.log(`⚠️ Allocating to payment:`, {
                     paymentId: payment.id,
@@ -562,14 +724,40 @@ export default function RentTrackerPage() {
                 updates: paymentsToUpdate
             });
 
+            // VERIFICATION POINT 2: Before database write
+            // CRITICAL: Verify we're NEVER updating due_date (it must remain immutable)
+            console.log('💰 PAYMENT RECONCILIATION - Before DB Write:', {
+                totalPaymentsToUpdate: paymentsToUpdate.length,
+                paymentUpdates: paymentsToUpdate.map(u => {
+                    // Find the original payment to compare
+                    const originalPayment = unpaidPayments.find(p => p.id === u.id);
+                    return {
+                        paymentId: u.id,
+                        ORIGINAL_DUE_DATE: originalPayment?.due_date,
+                        newStatus: u.status,
+                        newPaidDate: u.paid_date,
+                        newAmountPaid: u.amount_paid,
+                        verifyingDueDateNotInUpdate: !('due_date' in u) ? '✅ SAFE' : '❌ DANGER - due_date in update object!'
+                    };
+                })
+            });
+
             // Update all payments in database
+            // CRITICAL SAFEGUARD: NEVER update due_date - it must remain immutable
             for (const update of paymentsToUpdate) {
+                // Double-check that due_date is not in the update object
+                if ('due_date' in update) {
+                    console.error('❌ CRITICAL ERROR: Attempted to update due_date!', update);
+                    throw new Error('Cannot modify due_date - it must remain immutable');
+                }
+
                 const { error: updateError } = await supabase
                     .from('payments')
                     .update({
                         status: update.status,
                         paid_date: update.paid_date,
                         amount_paid: update.amount_paid // CRITICAL: Update this column
+                        // CRITICAL: due_date is NEVER updated - it must remain immutable
                     })
                     .eq('id', update.id);
 
@@ -605,13 +793,16 @@ export default function RentTrackerPage() {
                 timestamp: new Date().toISOString()
             };
 
-            // Update tenant's paymentHistory in database
+            // Update tenant's paymentHistory AND opening_arrears in database
             const currentHistory = tenant.paymentHistory || [];
             const updatedHistory = [paymentHistoryEntry, ...currentHistory];
 
             const { error: historyUpdateError } = await supabase
                 .from('tenants')
-                .update({ payment_history: updatedHistory })
+                .update({
+                    payment_history: updatedHistory,
+                    opening_arrears: newOpeningArrears // CRITICAL: Update reduced opening arrears
+                })
                 .eq('id', tenantId);
 
             if (historyUpdateError) {
@@ -619,12 +810,48 @@ export default function RentTrackerPage() {
                 // Don't throw - payment was recorded, history is just a nice-to-have
             }
 
+            console.log('✅ Opening arrears updated in database:', {
+                previousValue: tenant.openingArrears || 0,
+                newValue: newOpeningArrears,
+                reduction: (tenant.openingArrears || 0) - newOpeningArrears
+            });
+
+            // CRITICAL VALIDATION: Math must be perfectly reversible
+            const totalAllocated = ((tenant.openingArrears || 0) - newOpeningArrears) +
+                                   paymentsToUpdate.reduce((sum, p) => sum + (p.amount_paid - (unpaidPayments.find(up => up.id === p.id)?.amount_paid || 0)), 0);
+            console.log('🧮 PAYMENT - Allocation Math Validation:', {
+                originalPaymentAmount: paymentAmount,
+                openingArrearsReduction: (tenant.openingArrears || 0) - newOpeningArrears,
+                ledgerAllocations: paymentsToUpdate.map(p => ({
+                    paymentId: p.id,
+                    dueDate: unpaidPayments.find(up => up.id === p.id)?.due_date,
+                    previousPaid: unpaidPayments.find(up => up.id === p.id)?.amount_paid || 0,
+                    newPaid: p.amount_paid,
+                    allocated: p.amount_paid - (unpaidPayments.find(up => up.id === p.id)?.amount_paid || 0)
+                })),
+                totalAllocated,
+                shouldEqual: paymentAmount,
+                mathCheck: Math.abs(totalAllocated - paymentAmount) < 0.01 ? '✅ PASS' : '❌ FAIL - MONEY CREATED/DESTROYED!'
+            });
+
             toast.success("Payment recorded successfully");
 
             console.log('🔄 Refreshing data...');
             await fetchPayments();
             await fetchProperties();
             console.log('✅ Data refresh complete');
+
+            // VERIFICATION POINT 3: After success response
+            console.log('💰 PAYMENT RECONCILIATION - Success:', {
+                paymentAmount,
+                paymentDate,
+                paymentsUpdated: paymentsToUpdate.length,
+                finalUpdates: paymentsToUpdate.map(u => ({
+                    paymentId: u.id,
+                    status: u.status,
+                    paidDate: u.paid_date
+                }))
+            });
 
         } catch (error: any) {
             console.error('❌ Record payment error:', error);
@@ -635,7 +862,7 @@ export default function RentTrackerPage() {
     // Void a payment (reverse payment reconciliation)
     const handleVoidPayment = async (tenantId: string, paymentId: string) => {
         try {
-            console.log('🔄 VOID PAYMENT:', { tenantId, paymentId });
+            console.log('🔄 VOID PAYMENT - START:', { tenantId, paymentId });
 
             // Find tenant and payment history entry
             let flatTenants: Tenant[] = [];
@@ -652,6 +879,13 @@ export default function RentTrackerPage() {
                 toast.error("Payment not found");
                 return;
             }
+
+            console.log('🔍 VOID PAYMENT - Initial State:', {
+                tenantName: tenant.name,
+                currentOpeningArrears: tenant.openingArrears || 0,
+                paymentToVoidAmount: paymentToVoid.amount,
+                paymentToVoidDate: paymentToVoid.date
+            });
 
             // Get all payments for this tenant (most recent first for voiding)
             const { data: allPayments, error: fetchError } = await supabase
@@ -681,6 +915,16 @@ export default function RentTrackerPage() {
             let amountToReverse = paymentToVoid.amount;
             const paymentsToUpdate: { id: string, status: string, paid_date: string | null, amount_paid: number }[] = [];
 
+            // CRITICAL: Reverse ledger entries first (newest to oldest)
+            // WARNING: This reverses in OPPOSITE order from how payment was applied!
+            // Payment application: OLDEST → NEWEST (priority to old debts)
+            // Payment reversal: NEWEST → OLDEST (this line)
+            console.log('🔍 VOID - Starting ledger reversal:', {
+                totalToReverse: amountToReverse,
+                paymentRecordCount: allPayments.length,
+                reverseOrder: 'NEWEST → OLDEST'
+            });
+
             for (const payment of allPayments) {
                 if (amountToReverse <= 0.01) break;
 
@@ -690,6 +934,14 @@ export default function RentTrackerPage() {
                 // How much can we reverse from this payment?
                 const amountToDeduct = Math.min(amountToReverse, currentAmountPaid);
                 const newAmountPaid = currentAmountPaid - amountToDeduct;
+
+                console.log(`🔍 VOID - Processing payment record:`, {
+                    dueDate: payment.due_date,
+                    currentAmountPaid,
+                    amountToDeduct,
+                    newAmountPaid,
+                    amountStillToReverse: amountToReverse - amountToDeduct
+                });
 
                 // Determine new status
                 const isFullyPaid = newAmountPaid >= (payment.amount - 0.01);
@@ -702,26 +954,29 @@ export default function RentTrackerPage() {
                     // Still fully paid: paid_date stays the same
                     paidDate = payment.paid_date;
                 } else if (newStatus === 'Partial') {
-                    // Was fully paid, now partial: subtract the reversed amount's days
+                    // Partial payment after void: calculate pro-rata coverage from due date
+                    // Formula: PaidUntil = DueDate + (TotalPaid / TotalOwed) * CycleDays
+                    // CRITICAL: Always calculate from due_date based on TOTAL amount paid (ensures symmetry with payment recording)
                     const cycleDays = getCycleDays(tenant.frequency);
-                    const reversedCoverageRatio = amountToDeduct / payment.amount;
-                    const daysToSubtract = reversedCoverageRatio * cycleDays;
+                    const coverageRatio = newAmountPaid / payment.amount;
+                    const daysOfCoverage = coverageRatio * cycleDays;
 
-                    // CRITICAL: Subtract from CURRENT paid_date, use Math.round() for precision
-                    if (payment.paid_date) {
-                        const currentPaidDate = parseISO(payment.paid_date);
-                        const newPaidUntilDate = addDays(currentPaidDate, -Math.round(daysToSubtract));
-                        // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
-                        paidDate = format(newPaidUntilDate, 'yyyy-MM-dd');
-                    } else {
-                        // Fallback: shouldn't happen, but recalculate from due_date if no paid_date
-                        const dueDateObj = parseISO(payment.due_date);
-                        const coverageRatio = newAmountPaid / payment.amount;
-                        const daysToAdd = coverageRatio * cycleDays;
-                        const paidUntilDate = addDays(dueDateObj, Math.round(daysToAdd));
-                        // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
-                        paidDate = format(paidUntilDate, 'yyyy-MM-dd');
-                    }
+                    console.log('📊 VOID - Partial payment pro-rata calculation:', {
+                        dueDate: payment.due_date,
+                        previousPaid: currentAmountPaid,
+                        amountReversed: amountToDeduct,
+                        newTotalPaid: newAmountPaid,
+                        totalOwed: payment.amount,
+                        coverageRatio: coverageRatio.toFixed(4),
+                        cycleDays,
+                        daysOfCoverage: Math.round(daysOfCoverage),
+                        formula: `${payment.due_date} + ${Math.round(daysOfCoverage)} days`
+                    });
+
+                    // Always calculate from due_date to ensure consistency with payment recording
+                    const paidUntilDate = addDays(parseISO(payment.due_date), Math.round(daysOfCoverage));
+                    // CRITICAL: Store as date-only string (YYYY-MM-DD) to eliminate timezone drift
+                    paidDate = format(paidUntilDate, 'yyyy-MM-dd');
                 }
                 // If Unpaid, paidDate remains null
 
@@ -744,14 +999,49 @@ export default function RentTrackerPage() {
                 amountToReverse -= amountToDeduct;
             }
 
+            // CRITICAL: If amountToReverse still has value, it means the original payment
+            // had reduced opening_arrears. Add it back now.
+            let newOpeningArrears = tenant.openingArrears || 0;
+
+            console.log('🔍 VOID - After ledger reversal:', {
+                amountStillToReverse: amountToReverse,
+                currentOpeningArrears: tenant.openingArrears || 0,
+                ledgerRecordsReversed: paymentsToUpdate.length,
+                totalLedgerAmountReversed: paymentToVoid.amount - amountToReverse
+            });
+
+            if (amountToReverse > 0.01) {
+                newOpeningArrears += amountToReverse;
+                console.log('🔄 OPENING ARREARS REVERSAL (Void):', {
+                    previousOpeningArrears: tenant.openingArrears || 0,
+                    amountAddedBack: amountToReverse,
+                    newOpeningArrears,
+                    expectedOpeningArrears: 'Should match original pre-payment value'
+                });
+            } else {
+                console.log('⚠️ VOID - No opening arrears to restore:', {
+                    amountToReverse,
+                    allReversalWentToLedger: true,
+                    warning: 'If original payment reduced opening_arrears, this is a BUG!'
+                });
+            }
+
             // Update all affected payments
+            // CRITICAL SAFEGUARD: NEVER update due_date - it must remain immutable
             for (const update of paymentsToUpdate) {
+                // Double-check that due_date is not in the update object
+                if ('due_date' in update) {
+                    console.error('❌ CRITICAL ERROR: Attempted to update due_date in void!', update);
+                    throw new Error('Cannot modify due_date - it must remain immutable');
+                }
+
                 const { error: updateError } = await supabase
                     .from('payments')
                     .update({
                         status: update.status,
                         paid_date: update.paid_date,
                         amount_paid: update.amount_paid
+                        // CRITICAL: due_date is NEVER updated - it must remain immutable
                     })
                     .eq('id', update.id);
 
@@ -763,17 +1053,37 @@ export default function RentTrackerPage() {
                 console.log('✅ Reversed payment:', update.id);
             }
 
-            // Remove payment from tenant's payment history
+            // Remove payment from tenant's payment history AND restore opening_arrears
             const updatedHistory = paymentHistory.filter(p => p.id !== paymentId);
 
             const { error: historyUpdateError } = await supabase
                 .from('tenants')
-                .update({ payment_history: updatedHistory })
+                .update({
+                    payment_history: updatedHistory,
+                    opening_arrears: newOpeningArrears // CRITICAL: Restore opening arrears if applicable
+                })
                 .eq('id', tenantId);
 
             if (historyUpdateError) {
                 throw historyUpdateError;
             }
+
+            console.log('✅ Opening arrears restored in database (if applicable):', {
+                previousValue: tenant.openingArrears || 0,
+                newValue: newOpeningArrears,
+                increase: newOpeningArrears - (tenant.openingArrears || 0)
+            });
+
+            // CRITICAL VALIDATION: Math must be perfectly reversible
+            const totalReversed = (paymentToVoid.amount - amountToReverse) + (newOpeningArrears - (tenant.openingArrears || 0));
+            console.log('🧮 VOID - Reversal Math Validation:', {
+                originalPaymentAmount: paymentToVoid.amount,
+                ledgerReversalAmount: paymentToVoid.amount - amountToReverse,
+                openingArrearsRestored: newOpeningArrears - (tenant.openingArrears || 0),
+                totalReversed,
+                shouldEqual: paymentToVoid.amount,
+                mathCheck: totalReversed === paymentToVoid.amount ? '✅ PASS' : '❌ FAIL - MONEY CREATED/DESTROYED!'
+            });
 
             // Log the void action
             await logToEvidenceLedger(
@@ -1063,12 +1373,37 @@ export default function RentTrackerPage() {
                                 />
                             )}
                             {testDate && (
-                                <button
-                                    onClick={() => setTestDate(null)}
-                                    className="text-[10px] font-black uppercase tracking-widest text-[#FF3B3B] hover:text-[#FF3B3B]/80"
-                                >
-                                    Reset
-                                </button>
+                                <>
+                                    <button
+                                        onClick={() => setTestDate(null)}
+                                        className="text-[10px] font-black uppercase tracking-widest text-[#FF3B3B] hover:text-[#FF3B3B]/80"
+                                    >
+                                        Reset
+                                    </button>
+                                    <button
+                                        onClick={async () => {
+                                            setIsSyncingLedger(true);
+                                            console.log('🔄 MANUAL SYNC TRIGGERED:', {
+                                                currentTestDate: testDate ? format(testDate, 'yyyy-MM-dd') : 'None',
+                                                description: 'Simulating Roadmap Item #3 Cron Job - Running Watchdog'
+                                            });
+                                            await autoGeneratePayments();
+                                            toast.success("Ledger synced successfully");
+                                            setIsSyncingLedger(false);
+                                        }}
+                                        disabled={isSyncingLedger}
+                                        className="text-[10px] font-black uppercase tracking-widest bg-[#00FFBB]/10 text-[#00FFBB] px-3 py-1 rounded-lg border border-[#00FFBB]/30 hover:bg-[#00FFBB]/20 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                                    >
+                                        {isSyncingLedger ? (
+                                            <>
+                                                <Loader2 className="w-3 h-3 inline mr-1 animate-spin" />
+                                                Syncing...
+                                            </>
+                                        ) : (
+                                            'Sync Ledger'
+                                        )}
+                                    </button>
+                                </>
                             )}
                         </div>
                     </div>

@@ -26,7 +26,7 @@ interface AddTenantDialogProps {
 }
 
 const DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
-const DAYS_OF_MONTH = Array.from({ length: 28 }, (_, i) => (i + 1).toString());
+const DAYS_OF_MONTH = Array.from({ length: 31 }, (_, i) => (i + 1).toString());
 
 export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddress, onAdd }: AddTenantDialogProps) {
     const [firstName, setFirstName] = useState("");
@@ -101,7 +101,7 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                     phone: phone || "",
                     lease_start_date: leaseStartDate || null, // Optional: actual lease start date (for reference)
                     tracking_start_date: finalTrackingStartDate, // Required: when we started tracking
-                    opening_arrears: finalOpeningBalance, // Any existing debt when we started tracking
+                    opening_arrears: 0, // CRITICAL: Set to 0 because opening arrears are materialized as payment records below
                     weekly_rent: Number(amount), // This stores the rent amount regardless of frequency
                     tenant_address: address,
                     is_active: true,
@@ -114,6 +114,55 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
             if (error) throw error;
 
             if (data) {
+                // =====================================================================
+                // FIX: Arrears Amnesia Bug - Materialize Opening Arrears as Ledger Entry
+                // =====================================================================
+                // CRITICAL: If tenant has opening arrears, create an Unpaid payment record
+                // This ensures the debt is visible in the ledger, not just metadata
+                //
+                // BEFORE FIX:
+                //   - User sets $1000 opening arrears on Dec 1
+                //   - System stores it as tenant.opening_arrears field
+                //   - Watchdog generates Dec 30 record ($1000)
+                //   - Total shown: $1000 (missing the Dec 1 debt!) ❌
+                //
+                // AFTER FIX:
+                //   - User sets $1000 opening arrears on Dec 1
+                //   - System creates Unpaid record for Dec 1 ($1000)
+                //   - System sets tenant.opening_arrears = 0 (to avoid double-counting)
+                //   - Watchdog generates Dec 30 record ($1000)
+                //   - Total shown: $2000 ✅
+                // =====================================================================
+
+                if (finalOpeningBalance > 0 && finalTrackingStartDate) {
+                    console.log('💰 CREATING OPENING ARREARS RECORD:', {
+                        tenantName: `${firstName} ${lastName}`,
+                        amount: finalOpeningBalance,
+                        dueDate: finalTrackingStartDate,
+                        description: 'Initial debt from tracking start date'
+                    });
+
+                    const { error: paymentError } = await supabase
+                        .from('payments')
+                        .insert({
+                            tenant_id: data.id,
+                            property_id: propertyId,
+                            due_date: finalTrackingStartDate,
+                            amount: finalOpeningBalance,
+                            status: 'Unpaid',
+                            amount_paid: 0,
+                            paid_date: null
+                        });
+
+                    if (paymentError) {
+                        console.error('⚠️ Failed to create opening arrears record:', paymentError);
+                        // Don't throw - tenant was created successfully, this is just a ledger entry
+                        toast.error('Tenant created but opening arrears record failed. Please add manually.');
+                    } else {
+                        console.log('✅ Opening arrears record created successfully');
+                    }
+                }
+
                 onAdd({
                     id: data.id,
                     name: `${data.first_name} ${data.last_name}`.trim(),
@@ -277,7 +326,14 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                                 />
                             </div>
                             <div className="space-y-2">
-                                <Label>{frequency === "Monthly" ? "Due Day of Month" : "Due Day"}</Label>
+                                <Label>
+                                    {frequency === "Monthly" ? "Due Day of Month" : "Due Day"}
+                                    {frequency === "Monthly" && parseInt(dueDayOfMonth, 10) > 28 && (
+                                        <span className="text-[10px] text-white/40 ml-2 font-normal">
+                                            (snaps to month end for shorter months)
+                                        </span>
+                                    )}
+                                </Label>
                                 {frequency === "Monthly" ? (
                                     <Select value={dueDayOfMonth} onValueChange={setDueDayOfMonth}>
                                         <SelectTrigger>
@@ -308,7 +364,7 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
 
                         {/* Lease Start Date (Optional - for reference only) */}
                         <div className="space-y-2">
-                            <Label htmlFor="leaseStartDate">Lease Start (Optional)</Label>
+                            <Label htmlFor="leaseStartDate">Lease Start Date (Optional)</Label>
                             <div className="relative group">
                                 <Calendar className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40 group-focus-within:text-[#00FFBB] transition-colors" />
                                 <Input
@@ -320,7 +376,7 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                                 />
                             </div>
                             <p className="text-[10px] text-white/40 font-medium">
-                                When did the tenant move in? (for your records only)
+                                When did the tenant move in? (For your records only - not used for rent tracking)
                             </p>
                         </div>
 
@@ -370,7 +426,7 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                                             />
                                         </div>
                                         <p className="text-[10px] text-white/40 font-medium">
-                                            When should we start tracking rent?
+                                            When should we start tracking rent? (This is "Day 0" for arrears calculations)
                                         </p>
                                     </div>
 

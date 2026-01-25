@@ -262,7 +262,7 @@ export function SmartPaymentModal({
                                         {recentPayments.map((payment, index) => (
                                             <div
                                                 key={payment.id}
-                                                className="flex items-center justify-between py-2.5 px-3 bg-white/60 rounded-xl border border-gray-100 transition-all hover:bg-white/80"
+                                                className="flex items-center justify-between py-2.5 px-3 bg-white rounded-xl border border-gray-200 transition-all hover:bg-gray-50"
                                             >
                                                 <div className="flex-1 min-w-0">
                                                     <div className="flex items-center gap-2">
@@ -270,7 +270,7 @@ export function SmartPaymentModal({
                                                             ${payment.amount.toFixed(2)}
                                                         </span>
                                                         <span className="text-xs text-gray-400">•</span>
-                                                        <span className="text-xs text-gray-500 font-medium">
+                                                        <span className="text-xs text-gray-700 font-medium">
                                                             {format(parseISO(payment.date), "MMM d, yyyy")}
                                                         </span>
                                                     </div>

@@ -121,9 +121,11 @@ export function calculateDueDates(
     const todayObj = today instanceof Date ? today : new Date(today);
     const todayTime = startOfDay(todayObj).getTime();
 
-    // Safety limit: 100 iterations
+    // Safety limit: 520 iterations (~10 years @ weekly, 43 years @ monthly)
+    // Prevents infinite loops for edge cases or misconfigured tracking dates
     let iterations = 0;
-    while (iterations < 100) {
+    const MAX_ITERATIONS = 520;
+    while (iterations < MAX_ITERATIONS) {
         iterations++;
 
         dueDates.push(format(currentDueDate, "yyyy-MM-dd"));
@@ -136,7 +138,39 @@ export function calculateDueDates(
 
         // Advance to next period based on frequency
         if (frequency === "Monthly") {
-            currentDueDate = addMonths(currentDueDate, 1);
+            // CRITICAL FIX: Always respect rentDueDay setting when advancing months
+            // addMonths(Jan 31, 1) = Feb 28, which is WRONG if rentDueDay is '1'
+            // Instead, advance month but re-apply the exact day from rentDueDay
+            const nextMonthDate = addMonths(currentDueDate, 1);
+            const dayOfMonth = parseInt(rentDueDay, 10) || 1;
+
+            // Get the last day of the target month
+            const lastDayOfNextMonth = new Date(
+                nextMonthDate.getFullYear(),
+                nextMonthDate.getMonth() + 1,
+                0
+            ).getDate();
+
+            // Only snap to month-end if rentDueDay literally doesn't exist (e.g., 31st in Feb)
+            const effectiveDay = Math.min(dayOfMonth, lastDayOfNextMonth);
+
+            // Create date with the correct day
+            currentDueDate = new Date(
+                nextMonthDate.getFullYear(),
+                nextMonthDate.getMonth(),
+                effectiveDay
+            );
+
+            console.log('📅 Monthly Advance - Snap to rentDueDay:', {
+                previousDate: format(startOfDay(addMonths(currentDueDate, -1)), 'yyyy-MM-dd'),
+                addMonthsResult: format(nextMonthDate, 'yyyy-MM-dd'),
+                rentDueDay,
+                dayOfMonth,
+                lastDayOfNextMonth,
+                effectiveDay,
+                finalDate: format(currentDueDate, 'yyyy-MM-dd'),
+                description: effectiveDay !== dayOfMonth ? 'Snapped to month-end (day does not exist)' : 'Using exact rentDueDay'
+            });
         } else if (frequency === "Fortnightly") {
             currentDueDate = addDays(currentDueDate, 14);
         } else {
@@ -147,6 +181,17 @@ export function calculateDueDates(
         if (isAfter(currentDueDate, addDays(todayObj, 366))) {
             break;
         }
+    }
+
+    // Warn if we hit the iteration limit
+    if (iterations >= MAX_ITERATIONS) {
+        console.warn('⚠️ calculateDueDates reached max iterations', {
+            generationStartDate: generationStartDate ? format(generationStartDate, 'yyyy-MM-dd') : 'N/A',
+            today: format(today, 'yyyy-MM-dd'),
+            iterations,
+            frequency,
+            dueDatesGenerated: dueDates.length
+        });
     }
 
     console.log('📅 RESULTING DUE DATES:', dueDates);

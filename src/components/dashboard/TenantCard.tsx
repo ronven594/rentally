@@ -59,6 +59,7 @@ interface TenantCardProps {
     onVoidPayment?: (tenantId: string, paymentId: string) => Promise<void>;
     onSettings: () => void;
     onSettleOpeningBalance?: (tenantId: string) => Promise<void>; // Settlement action for backdated tenants
+    testDate?: Date; // Test/simulation date override - falls back to real-world date if not provided
 }
 
 export function TenantCard({
@@ -70,6 +71,7 @@ export function TenantCard({
     onVoidPayment,
     onSettings,
     onSettleOpeningBalance,
+    testDate,
 }: TenantCardProps) {
     const [isPaymentModalOpen, setIsPaymentModalOpen] = useState(false);
     const [isSettling, setIsSettling] = useState(false);
@@ -89,8 +91,19 @@ export function TenantCard({
     // CRITICAL: Lock all date comparisons to NZ timezone (Pacific/Auckland)
     // This ensures status shifts correctly at 12:01 AM NZ time, not server time
     // toZonedTime converts UTC to NZ local, then startOfDay normalizes to midnight
-    const todayNZ = toZonedTime(new Date(), NZ_TIMEZONE);
+    // PRODUCTION-READY: Uses testDate for simulation if provided, otherwise defaults to real-world date
+    const effectiveDate = testDate || new Date();
+    const todayNZ = toZonedTime(effectiveDate, NZ_TIMEZONE);
     const today = startOfDay(todayNZ);
+
+    // DIAGNOSTIC: Log effective date to verify centralized date awareness
+    console.log('📅 TENANT CARD - EFFECTIVE DATE:', {
+        tenantName: tenant.name,
+        testDateProvided: testDate ? format(testDate, 'yyyy-MM-dd HH:mm:ss') : 'None (using real-world date)',
+        effectiveDate: format(effectiveDate, 'yyyy-MM-dd HH:mm:ss'),
+        todayNormalized: format(today, 'yyyy-MM-dd'),
+        isSimulationMode: !!testDate
+    });
 
     // Helper: Normalize a date string to start of day for comparison
     // Uses NZ timezone to ensure consistent date handling regardless of server location
@@ -104,42 +117,125 @@ export function TenantCard({
     // PAYMENT CLASSIFICATION: Separate past, today, and future payments
     // =========================================================================
 
+    // DIAGNOSTIC: Log ALL payments first to see what we're working with
+    // CRITICAL: Check if due_date has been corrupted to payment_date
+    console.log('🔍 TENANT CARD - ALL PAYMENTS (raw from database):', {
+        tenantName: tenant.name,
+        today: format(today, 'yyyy-MM-dd'),
+        frequency: tenant.frequency,
+        rentDueDay: tenant.rentDueDay,
+        totalPaymentsCount: payments.length,
+        allPayments: payments.map(p => ({
+            id: p.id,
+            dueDate: p.dueDate,
+            paidDate: p.paidDate,
+            status: p.status,
+            amount: p.amount,
+            amountPaid: p.amount_paid,
+            isPartial: p.status === 'Partial',
+            isUnpaid: p.status === 'Unpaid',
+            willBeIncluded: p.status === 'Unpaid' || p.status === 'Partial',
+            // CRITICAL: Detect if due_date was corrupted to match paid_date
+            dueDateMatchesPaidDate: p.paidDate && p.dueDate === p.paidDate ? '⚠️ CORRUPTED!' : 'OK',
+            // For monthly: check if due_date day matches rentDueDay
+            dueDateDay: tenant.frequency === 'Monthly' ? parseInt(p.dueDate.substring(8, 10)) : 'N/A',
+            expectedDay: tenant.frequency === 'Monthly' ? tenant.rentDueDay : 'N/A'
+        }))
+    });
+
     // Get ALL unpaid/partial payments (regardless of date)
     const allUnpaidPayments = payments.filter(p =>
         p.status === 'Unpaid' || p.status === 'Partial'
     );
+
+    // Check for duplicate months (would indicate corrupted data)
+    const monthCounts = new Map<string, number>();
+    allUnpaidPayments.forEach(p => {
+        const month = p.dueDate.substring(0, 7); // YYYY-MM
+        monthCounts.set(month, (monthCounts.get(month) || 0) + 1);
+    });
+    const duplicateMonths = Array.from(monthCounts.entries()).filter(([_, count]) => count > 1);
+
+    // =========================================================================
+    // ORPHANED RECORD DETECTION: Check for setting misalignment
+    // =========================================================================
+    // Detect when payment records have due_dates that don't match current tenant settings
+    // This happens when:
+    // 1. rentDueDay changed (e.g., 30th → 1st for Monthly)
+    // 2. frequency changed (e.g., Weekly → Fortnightly)
+    // 3. rentDueDay changed day-of-week (e.g., Wednesday → Friday for Weekly)
+
+    const orphanedRecords: Array<{ dueDate: string; issue: string }> = [];
+
+    allUnpaidPayments.forEach(p => {
+        const dueDate = parseISO(p.dueDate);
+
+        if (tenant.frequency === 'Monthly') {
+            // For Monthly: Check if day-of-month matches current rentDueDay
+            const actualDayOfMonth = dueDate.getDate();
+            const expectedDayOfMonth = parseInt(tenant.rentDueDay, 10) || 1;
+
+            // Account for month-end snapping (e.g., Feb 28 for rentDueDay=31)
+            const lastDayOfMonth = new Date(dueDate.getFullYear(), dueDate.getMonth() + 1, 0).getDate();
+            const effectiveExpectedDay = Math.min(expectedDayOfMonth, lastDayOfMonth);
+
+            if (actualDayOfMonth !== effectiveExpectedDay) {
+                orphanedRecords.push({
+                    dueDate: p.dueDate,
+                    issue: `Monthly day mismatch: Record has day ${actualDayOfMonth}, current setting is ${tenant.rentDueDay}`
+                });
+            }
+        } else {
+            // For Weekly/Fortnightly: Check if day-of-week matches current rentDueDay
+            const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+            const actualDayName = dayNames[dueDate.getDay()];
+
+            if (actualDayName !== tenant.rentDueDay) {
+                orphanedRecords.push({
+                    dueDate: p.dueDate,
+                    issue: `${tenant.frequency} day mismatch: Record is ${actualDayName}, current setting is ${tenant.rentDueDay}`
+                });
+            }
+        }
+    });
+
+    console.log('🔍 TENANT CARD - AFTER UNPAID/PARTIAL FILTER:', {
+        tenantName: tenant.name,
+        allUnpaidCount: allUnpaidPayments.length,
+        duplicateMonthsDetected: duplicateMonths.length > 0 ? `⚠️ ${duplicateMonths.map(([m, c]) => `${m}: ${c} records`).join(', ')}` : 'None',
+        orphanedRecordsDetected: orphanedRecords.length > 0 ? `⚠️ ${orphanedRecords.length} record(s) don't match current settings` : 'None - All records align with current settings',
+        orphanedRecordDetails: orphanedRecords.length > 0 ? orphanedRecords : 'N/A',
+        filteredPayments: allUnpaidPayments.map(p => ({
+            id: p.id,
+            dueDate: p.dueDate,
+            status: p.status,
+            amountPaid: p.amount_paid,
+            normalizedDueDate: format(normalizeDate(p.dueDate), 'yyyy-MM-dd'),
+            isBeforeTodayCheck: isBefore(normalizeDate(p.dueDate), today),
+            todayForComparison: format(today, 'yyyy-MM-dd')
+        }))
+    });
 
     // PAST: Unpaid payments with due date < today (MISSED)
     const missedPayments = allUnpaidPayments
         .filter(p => isBefore(normalizeDate(p.dueDate), today))
         .sort((a, b) => normalizeDate(a.dueDate).getTime() - normalizeDate(b.dueDate).getTime());
 
-    // TRUE NEXT: Find first payment (any status) with due date > today
-    // This is the actual next payment cycle regardless of payment status
-    const trueNextPaymentFromDB = payments
-        .filter(p => isBefore(today, normalizeDate(p.dueDate))) // dueDate > today (strictly future)
-        .sort((a, b) => normalizeDate(a.dueDate).getTime() - normalizeDate(b.dueDate).getTime())[0];
-
     // =========================================================================
-    // ROLLING NEXT DATE: If no future payment in DB, calculate mathematically
+    // PAID UNTIL DATE: Find most recent payment with a paidDate
     // =========================================================================
-    // This ensures we ALWAYS have a valid future date to display
-    let calculatedNextDate: Date | null = null;
+    // CRITICAL: This is the "coverage-first" logic - shows when tenant is PAID UNTIL
+    // NOT when next rent is DUE (fixes "The Arrears Trap")
+    const mostRecentPaidPayment = payments
+        .filter(p => p.paidDate != null) // Only payments that have been paid
+        .sort((a, b) => parseISO(b.paidDate!).getTime() - parseISO(a.paidDate!).getTime())[0]; // Most recent first
 
-    if (!trueNextPaymentFromDB) {
-        // No future payment in DB - calculate from most recent payment or oldest missed
-        const mostRecentPayment = payments
-            .sort((a, b) => normalizeDate(b.dueDate).getTime() - normalizeDate(a.dueDate).getTime())[0];
+    // FUTURE: Upcoming unpaid payments (for "Paid Until" fallback when no payments made yet)
+    const upcomingPayments = allUnpaidPayments
+        .filter(p => !isBefore(normalizeDate(p.dueDate), today)) // Due date >= today
+        .sort((a, b) => normalizeDate(a.dueDate).getTime() - normalizeDate(b.dueDate).getTime());
 
-        if (mostRecentPayment) {
-            // Roll forward from most recent payment until we find a future date
-            calculatedNextDate = findFirstFutureDueDate(
-                normalizeDate(mostRecentPayment.dueDate),
-                tenant.frequency,
-                today
-            );
-        }
-    }
+    const nextUpcomingPayment = upcomingPayments[0];
 
     // =========================================================================
     // DERIVED VALUES
@@ -147,6 +243,26 @@ export function TenantCard({
 
     const oldestMissedPayment = missedPayments[0];
     const missedPaymentCount = missedPayments.length;
+
+    console.log('🔍 TENANT CARD - Payment Classification:', {
+        tenantName: tenant.name,
+        today: format(today, 'yyyy-MM-dd'),
+        allPaymentsCount: payments.length,
+        allUnpaidCount: allUnpaidPayments.length,
+        missedPaymentsCount: missedPaymentCount,
+        allUnpaidPayments: allUnpaidPayments.map(p => ({
+            dueDate: p.dueDate,
+            status: p.status,
+            amount: p.amount,
+            amountPaid: p.amount_paid,
+            paidDate: p.paidDate,
+            isBeforeToday: isBefore(normalizeDate(p.dueDate), today)
+        })),
+        oldestMissedPayment: oldestMissedPayment ? {
+            dueDate: oldestMissedPayment.dueDate,
+            status: oldestMissedPayment.status
+        } : null
+    });
 
     // HARD OVERRIDE: Force "Missed" if legal engine says we're overdue
     // This catches cases where payment array might be missing entries
@@ -163,9 +279,16 @@ export function TenantCard({
     // DISPLAY DATES: What to show in the UI
     // =========================================================================
 
+    // =========================================================================
+    // OVERDUE SINCE ANCHOR: Must use DUE_DATE, not PAID_DATE
+    // =========================================================================
     // Missed date: Oldest unpaid payment in the past
-    // Priority: 1) Actual payment record, 2) ANCHORED date from legal engine
+    // Priority: 1) Actual payment record's DUE_DATE (from database)
+    // Priority: 2) ANCHORED date from legal engine (from database-driven calculation)
     // CRITICAL: Uses firstMissedDueDate which is ANCHORED (does NOT float daily)
+    //
+    // CRITICAL FIX: This must ALWAYS use due_date, never paid_date
+    // The "overdue since" anchor is when the rent was DUE, not when payment was made
     const missedDate = oldestMissedPayment
         ? format(normalizeDate(oldestMissedPayment.dueDate), 'MMM d')
         : (legalEngineSaysOverdue && legalStatus.firstMissedDueDate)
@@ -173,20 +296,54 @@ export function TenantCard({
             ? format(parseISO(legalStatus.firstMissedDueDate), 'MMM d')
             : null;
 
-    // True Next date: First payment cycle in the future
-    // Priority: 1) Future payment from DB, 2) Calculated rolling date
-    // CRITICAL: This MUST be a future date, never a past date
-    const trueNextDate = trueNextPaymentFromDB
-        ? format(normalizeDate(trueNextPaymentFromDB.dueDate), 'MMM d')
-        : calculatedNextDate
-            ? format(calculatedNextDate, 'MMM d')
-            : null;
+    console.log('🔍 TENANT CARD - Overdue Since Anchor (Must Be Due Date):', {
+        tenantName: tenant.name,
+        oldestMissedPaymentExists: !!oldestMissedPayment,
+        oldestMissedPayment_DUE_DATE: oldestMissedPayment?.dueDate,
+        oldestMissedPayment_PAID_DATE: oldestMissedPayment?.paidDate,
+        VERIFICATION_UsingDueDate: oldestMissedPayment ? '✅ Using due_date, not paid_date' : 'N/A',
+        legalEngineSaysOverdue,
+        firstMissedDueDateFromLegalEngine: legalStatus.firstMissedDueDate,
+        calculatedMissedDate: missedDate,
+        fallbackUsed: !oldestMissedPayment && legalEngineSaysOverdue && legalStatus.firstMissedDueDate ? 'Legal Engine' : oldestMissedPayment ? 'UI Payment Record' : 'None',
+        WARNING_IfShowingPaymentDate: missedDate && oldestMissedPayment?.paidDate && missedDate.includes(format(parseISO(oldestMissedPayment.paidDate), 'd')) ? '❌ BUG: Showing payment date instead of due date!' : '✅ Correct'
+    });
+
+    // =========================================================================
+    // BALANCE-AWARE PAID UNTIL: Only show if fully paid
+    // =========================================================================
+    // CRITICAL FIX: Don't show "Paid until [future date]" if balance outstanding
+    // A tenant who paid $100 of $1000 is NOT "paid until" anything - they're in arrears
+    // Only show "Paid until" when totalBalanceDue <= 0
+    //
+    // Priority (when fully paid):
+    // 1) Most recent paidDate from any payment
+    // 2) Next upcoming payment due date (for new tenants with no payments yet)
+    // 3) Tracking start date (absolute fallback)
+    const paidUntilDate = totalBalanceDue <= 0
+        ? (mostRecentPaidPayment
+            ? format(parseISO(mostRecentPaidPayment.paidDate!), 'MMM d')
+            : nextUpcomingPayment
+                ? format(normalizeDate(nextUpcomingPayment.dueDate), 'MMM d')
+                : tenant.trackingStartDate
+                    ? format(parseISO(tenant.trackingStartDate), 'MMM d')
+                    : null)
+        : null; // If any balance outstanding, don't show "paid until" date
+
+    console.log('🔍 TENANT CARD - Paid Until Logic (Balance-Aware):', {
+        tenantName: tenant.name,
+        totalBalanceDue: totalBalanceDue.toFixed(2),
+        isFullyPaid: totalBalanceDue <= 0,
+        paidUntilDate: paidUntilDate || 'NULL - Balance outstanding',
+        mostRecentPaidPaymentExists: !!mostRecentPaidPayment,
+        mostRecentPaidPaymentDate: mostRecentPaidPayment?.paidDate
+    });
 
     // =========================================================================
     // SAFE DISPLAY VALUES: Guaranteed non-null strings for UI
     // =========================================================================
-    // safeNextDate: Always a future date or placeholder
-    const safeNextDate = trueNextDate || '-';
+    // safePaidUntilDate: Paid until date or placeholder (only used when NOT overdue)
+    const safePaidUntilDate = paidUntilDate || '-';
     // safeMissedDate: Oldest missed payment date (calculated from legal engine if no payment record)
     const safeMissedDate = missedDate || '-';
 
@@ -197,6 +354,16 @@ export function TenantCard({
     // This ensures the day count is always accurate even if one source lags behind
     // CRITICAL: This value updates every morning at 12:01 AM NZ time
     const effectiveDaysOverdue = Math.max(daysOverdue, calculatedDaysOverdue);
+
+    console.log('🔍 TENANT CARD - Days Overdue Calculation:', {
+        tenantName: tenant.name,
+        daysOverdueFromLegalEngine: daysOverdue,
+        calculatedDaysOverdueFromUI: calculatedDaysOverdue,
+        effectiveDaysOverdue,
+        source: daysOverdue > calculatedDaysOverdue ? 'Legal Engine' : calculatedDaysOverdue > daysOverdue ? 'UI Calculation' : 'Both Equal',
+        totalBalanceDue,
+        legalEngineSaysOverdue
+    });
 
     // Handle payment confirmation from modal
     const handleConfirmPayment = async (amount: number, date: string) => {
@@ -377,7 +544,22 @@ export function TenantCard({
             };
         }
 
-        // Default fallback (should never reach)
+        // Default fallback for edge cases
+        // If we got here with a balance due, it means:
+        // - workingDaysOverdue = 0 (payment due today or in future)
+        // - totalBalanceDue > 0 (tenant owes money)
+        // This should show as GREEN (current) since no deadlines have been missed yet
+        if (totalBalanceDue > 0) {
+            return {
+                tier: 'GREEN',
+                color: '#22C55E',
+                label: 'Current',
+                bannerText: '',
+                buttonText: ''
+            };
+        }
+
+        // Fully paid and current
         return {
             tier: 'GREEN',
             color: '#22C55E',
@@ -457,21 +639,32 @@ export function TenantCard({
                 <span style={{ color: '#94A3B8' }}>${tenant.rentAmount}/{formatFrequencyLabel(tenant.frequency)}</span>
                 {/* Middle dot separator with tight padding */}
                 <span className="text-white/20 mx-1.5">•</span>
-                {hasMissedPayment ? (
+                {/* CRITICAL: Balance takes priority - if totalBalanceDue > 0, NEVER show "Paid until" */}
+                {totalBalanceDue > 0 ? (
                     <>
-                        {/* Overdue segment - Matches Severity Tier Color */}
-                        <span style={{ color: severity.color }}>
-                            {effectiveDaysOverdue} day{effectiveDaysOverdue !== 1 ? 's' : ''} overdue since {safeMissedDate}
-                        </span>
-                        <span className="text-white/20 mx-1.5">•</span>
-                        <span style={{ color: severity.color }} className="font-bold">
-                            ${totalBalanceDue.toFixed(2)} outstanding
-                        </span>
+                        {/* Balance outstanding - show overdue if days >= 1, otherwise show current balance */}
+                        {effectiveDaysOverdue >= 1 ? (
+                            <>
+                                {/* Overdue segment - Matches Severity Tier Color */}
+                                <span style={{ color: severity.color }}>
+                                    {effectiveDaysOverdue} day{effectiveDaysOverdue !== 1 ? 's' : ''} overdue since {safeMissedDate}
+                                </span>
+                                <span className="text-white/20 mx-1.5">•</span>
+                                <span style={{ color: severity.color }} className="font-bold">
+                                    ${totalBalanceDue.toFixed(2)} outstanding
+                                </span>
+                            </>
+                        ) : (
+                            /* Balance exists but not overdue yet (due today or in future) */
+                            <span style={{ color: severity.color }} className="font-bold">
+                                Current balance: ${totalBalanceDue.toFixed(2)}
+                            </span>
+                        )}
                     </>
                 ) : (
-                    /* Paid state - Green */
+                    /* Paid state - Green - Only show when totalBalanceDue <= 0 */
                     <span style={{ color: severity.color, opacity: 0.7 }}>
-                        Paid until {safeNextDate}
+                        {paidUntilDate ? `Paid until ${paidUntilDate}` : 'No payments recorded'}
                     </span>
                 )}
             </p>
@@ -609,25 +802,44 @@ export function TenantCard({
                                 )}
                             </Button>
 
-                            {/* Issue Next Strike - Red Outline (Only if < 3 strikes) */}
+                            {/* Issue Next Strike - Adaptive styling based on route */}
+                            {/* Only show if < 3 strikes. Style adapts based on which route triggered termination: */}
+                            {/* - If 3-strike route: Hidden (strikeCount = 3) */}
+                            {/* - If 21-day route: Shown but subtle (backup option) */}
                             {(severity.strikeCount ?? 0) < 3 && (() => {
                                 const nextStrike = (severity.strikeCount ?? 0) + 1;
                                 const strikeLabel = nextStrike === 1 ? 'STRIKE 1' : nextStrike === 2 ? 'STRIKE 2' : 'STRIKE 3';
+                                // Check if termination reached via 21-day route (not strike route)
+                                const via21DayRoute = daysOverdue >= 21 && (severity.strikeCount ?? 0) < 3;
+
+                                // DEBUG: Log the de-emphasis condition
+                                console.log('🔍 STRIKE BUTTON DE-EMPHASIS CHECK:', {
+                                    daysOverdue,
+                                    strikeCount: severity.strikeCount,
+                                    via21DayRoute,
+                                    willDeEmphasize: via21DayRoute,
+                                    borderColor: via21DayRoute ? 'rgba(255, 59, 59, 0.4)' : '#FF3B3B',
+                                    textColor: via21DayRoute ? 'rgba(255, 59, 59, 0.7)' : '#FF3B3B'
+                                });
+
                                 return (
                                     <Button
                                         size="brand"
+                                        variant={null as any} // CRITICAL: Prevent default variant from applying text-primary-foreground
                                         onClick={(e) => {
                                             e.stopPropagation();
-                                            console.log(`📋 STRIKE ${nextStrike}: Continuing strike process as backup`);
+                                            console.log(`📋 STRIKE ${nextStrike}: Continuing strike process ${via21DayRoute ? '(backup path - termination via 21-day route)' : 'as backup'}`);
                                             console.log('🎯 Current strikes:', severity.strikeCount);
+                                            console.log('📅 Days overdue:', daysOverdue);
                                         }}
-                                        className="flex-1 rounded-2xl transition-all tabular-nums bg-transparent border-2"
+                                        className="flex-1 rounded-2xl transition-all tabular-nums bg-transparent border-2 font-black uppercase tracking-widest"
                                         style={{
-                                            borderColor: '#FF3B3B',
-                                            color: '#FF3B3B'
+                                            borderColor: via21DayRoute ? 'rgba(255, 59, 59, 0.4)' : '#FF3B3B',
+                                            color: via21DayRoute ? 'rgba(255, 59, 59, 0.7)' : '#FF3B3B'
                                         }}
+                                        title={via21DayRoute ? "Alternative path: Build strike history for stronger tribunal case" : undefined}
                                     >
-                                        <FileWarning className="w-4 h-4" />
+                                        <FileWarning className="w-4 h-4" style={{ opacity: via21DayRoute ? 0.7 : 1 }} />
                                         ISSUE {strikeLabel}
                                     </Button>
                                 );

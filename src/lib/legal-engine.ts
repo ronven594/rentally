@@ -579,16 +579,12 @@ export function analyzeTenancySituation(input: AnalysisInput): AnalysisResult {
         ledger = getValidLedger(input.ledger, trackingStartDate);
     }
 
-    // 2. FILTER LEDGER FOR FUTURE PAYMENTS
-    // CRITICAL: Only include payments that are due on or before the current date
-    // Payments due in the future should NOT count toward arrears (they're not yet due)
-    // NOTE: Normalize dueDate to startOfDay to avoid timezone issues where
-    // parseISO("2026-01-25") creates UTC midnight (not local midnight)
-    ledger = ledger.filter(entry => {
-        const dueDate = startOfDay(parseISO(entry.dueDate));
-        // Include only if dueDate <= currentDate (both normalized to start of day)
-        return isBefore(dueDate, currentDate) || isEqual(dueDate, currentDate);
-    });
+    // 2. ARREARS CALCULATION LOGIC
+    // Total balance = SUM of all records where status === 'Unpaid' or 'Partial'
+    // We do NOT filter by due_date because:
+    // - Opening arrears can have future due dates but are already overdue
+    // - The status field is the source of truth for whether a payment counts toward balance
+    // NOTE: The ledger is already filtered for "ghost payments" (before tracking start date)
 
     // 3. CALCULATE ARREARS
     // Total = Opening Arrears + Unpaid entries after Tracking Start Date (and on or before current date)

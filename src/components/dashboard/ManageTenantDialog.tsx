@@ -40,7 +40,7 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
     const [email, setEmail] = useState("");
     const [phone, setPhone] = useState("");
     const [amount, setAmount] = useState("");
-    const [frequency, setFrequency] = useState<"Weekly" | "Fortnightly">("Weekly");
+    const [frequency, setFrequency] = useState<"Weekly" | "Fortnightly" | "Monthly">("Weekly");
     const [rentDueDay, setRentDueDay] = useState("Wednesday");
     const [address, setAddress] = useState("");
     const [leaseStartDate, setLeaseStartDate] = useState("");
@@ -63,6 +63,23 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
             setLeaseStartDate(tenant.startDate ? tenant.startDate.split('T')[0] : "");
         }
     }, [open, tenant]);
+
+    // Auto-reset Due Day when frequency changes to prevent invalid state
+    useEffect(() => {
+        if (!open) return;
+
+        const currentValue = rentDueDay;
+        const isNumeric = !isNaN(parseInt(currentValue, 10));
+        const isDayName = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].includes(currentValue);
+
+        if (frequency === "Monthly" && isDayName) {
+            // Switching TO Monthly with a day name selected - reset to 1st
+            setRentDueDay("1");
+        } else if ((frequency === "Weekly" || frequency === "Fortnightly") && isNumeric) {
+            // Switching FROM Monthly to Weekly/Fortnightly with a number selected - reset to Wednesday
+            setRentDueDay("Wednesday");
+        }
+    }, [frequency, open]);
 
     const handleSave = () => {
         onUpdate(tenant.id, {
@@ -172,19 +189,32 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
                             <SelectContent>
                                 <SelectItem value="Weekly">Weekly</SelectItem>
                                 <SelectItem value="Fortnightly">Fortnightly</SelectItem>
+                                <SelectItem value="Monthly">Monthly</SelectItem>
                             </SelectContent>
                         </Select>
                     </div>
                     <div className="grid gap-2">
-                        <Label>Due Day</Label>
+                        <Label>
+                            {frequency === "Monthly" ? "Due Day of Month" : "Due Day"}
+                            {frequency === "Monthly" && parseInt(rentDueDay, 10) > 28 && (
+                                <span className="text-[10px] text-white/40 ml-2 font-normal">
+                                    (snaps to month end)
+                                </span>
+                            )}
+                        </Label>
                         <Select value={rentDueDay} onValueChange={setRentDueDay}>
                             <SelectTrigger>
                                 <SelectValue />
                             </SelectTrigger>
                             <SelectContent>
-                                {["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map(d => (
-                                    <SelectItem key={d} value={d}>{d}</SelectItem>
-                                ))}
+                                {frequency === "Monthly"
+                                    ? Array.from({ length: 31 }, (_, i) => (i + 1).toString()).map(d => (
+                                        <SelectItem key={d} value={d}>{d}</SelectItem>
+                                      ))
+                                    : ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].map(d => (
+                                        <SelectItem key={d} value={d}>{d}</SelectItem>
+                                      ))
+                                }
                             </SelectContent>
                         </Select>
                     </div>
@@ -192,7 +222,7 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
 
                 {/* Lease Period */}
                 <div className="space-y-2">
-                    <Label htmlFor="lease-start">Lease Start (Optional)</Label>
+                    <Label htmlFor="lease-start">Lease Start Date (Optional)</Label>
                     <div className="relative group">
                         <Calendar className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-white/40 group-focus-within:text-[#00FFBB] transition-colors" />
                         <Input
