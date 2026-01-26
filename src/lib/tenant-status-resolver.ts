@@ -19,7 +19,7 @@
  * with ledger-regenerator.ts.
  */
 
-import { parseISO, differenceInCalendarDays, format } from "date-fns";
+import { parseISO, format } from "date-fns";
 import {
     calculateGroundZero,
     calculatePaidUntilStatus,
@@ -27,6 +27,9 @@ import {
     type DateMathSettings,
     type PaymentFrequency
 } from "./payment-date-math";
+
+// Import from unified date-utils for consistent date handling
+import { daysBetween } from "./date-utils";
 
 export interface PaymentRecord {
     id: string;
@@ -224,7 +227,7 @@ export function resolveTenantStatus(
         const oldestUnpaid = sortedPayments.find(p => unpaidRecords.includes(p.id));
         if (oldestUnpaid) {
             const oldestUnpaidDate = parseISO(oldestUnpaid.due_date);
-            daysOverdue = differenceInCalendarDays(currentDate, oldestUnpaidDate);
+            daysOverdue = daysBetween(oldestUnpaidDate, currentDate);
             dateSince = format(oldestUnpaidDate, 'MMM d');
             nextDueDateStr = oldestUnpaid.due_date;
         }

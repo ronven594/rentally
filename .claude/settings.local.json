@@ -6,7 +6,8 @@
       "Bash(node:*)",
       "Bash(command -v:*)",
       "Bash(npx supabase:*)",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(npx ts-node:*)"
     ]
   }
 }

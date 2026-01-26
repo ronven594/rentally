@@ -9,6 +9,8 @@
  *
  * PERFORMANCE: Uses stable memoization to prevent unnecessary re-renders.
  * Only re-calculates when actual data changes, not when array references change.
+ *
+ * IMPORTANT: Uses date-utils.ts for all date handling to ensure consistency.
  */
 
 import { useMemo } from 'react';
@@ -16,11 +18,14 @@ import { analyzeTenancySituation, type StrikeRecord, type AnalysisResult } from 
 import { STRIKE_NOTICE_WORKING_DAYS, TERMINATION_ELIGIBLE_DAYS, NOTICE_REMEDY_PERIOD, TRIBUNAL_FILING_WINDOW_DAYS } from '@/lib/rta-constants';
 import type { RentPayment } from '@/types';
 import type { NZRegion } from '@/lib/nz-holidays';
-import { parseISO, differenceInCalendarDays, addDays, format, isAfter, startOfDay, isBefore, isEqual, addWeeks, addMonths, getDay, nextDay } from 'date-fns';
+import { parseISO, differenceInCalendarDays, format, isAfter, isBefore, isEqual, addWeeks, addMonths, getDay, nextDay } from 'date-fns';
 import { toZonedTime } from 'date-fns-tz';
 
-// NZ Timezone for consistent date handling
-const NZ_TIMEZONE = "Pacific/Auckland";
+// Import NZ_TIMEZONE from unified date-utils module (single source of truth)
+import { NZ_TIMEZONE, addDays, startOfDay } from '@/lib/date-utils';
+
+// Import deterministic rent calculator
+import { calculateRentState, toRentSettings, toPayments, type RentSettings } from '@/lib/rent-calculator';
 
 // ============================================================================
 // TYPES
@@ -36,6 +41,7 @@ export interface UseRentalLogicInput {
     openingArrears?: number; // Any existing debt when we started tracking (defaults to 0)
     frequency?: "Weekly" | "Fortnightly" | "Monthly"; // Payment frequency for due date calculation
     rentDueDay?: string; // e.g. "Wednesday" for weekly/fortnightly, or "1" for monthly (day of month)
+    rentAmount?: number; // Rent amount per cycle (required for deterministic calculation)
 }
 
 // ============================================================================
@@ -539,8 +545,63 @@ export function calculateRentalLogic(input: UseRentalLogicInput): RentalLogicRes
             : 'No filtering (no tracking start date provided)'
     });
 
-    // SINGLE SOURCE OF TRUTH: Use totalArrears from legal engine (already filtered for ghost arrears)
-    const totalBalanceDue = legalAnalysis.analysis.totalArrears;
+    // =========================================================================
+    // DETERMINISTIC BALANCE CALCULATION
+    // =========================================================================
+    // Use the deterministic rent calculator if all required fields are present.
+    // Formula: Balance = (Cycles × Rent) + Opening Arrears - Sum(Payments)
+    // Fallback to legal engine's status-based calculation if rentAmount is missing.
+    // =========================================================================
+    let totalBalanceDue: number;
+    let deterministicDaysOverdue: number | null = null;
+    let deterministicFirstMissedDate: Date | null = null;
+
+    if (input.rentAmount && input.frequency && input.rentDueDay && input.trackingStartDate) {
+        // Use deterministic calculation
+        const rentSettings: RentSettings = {
+            frequency: input.frequency,
+            rentAmount: input.rentAmount,
+            rentDueDay: input.frequency === 'Monthly'
+                ? parseInt(input.rentDueDay, 10) || 1
+                : input.rentDueDay,
+            trackingStartDate: input.trackingStartDate,
+            openingArrears: input.openingArrears || 0
+        };
+
+        // Convert payments to the format expected by rent calculator
+        // Only include actual payments (where amount_paid > 0 and paidDate exists)
+        const rentPayments = input.payments
+            .filter(p => (p.amount_paid || 0) > 0 && p.paidDate)
+            .map(p => ({
+                id: p.id,
+                amount: p.amount_paid || 0,
+                date: p.paidDate || ''
+            }));
+
+        const rentState = calculateRentState(rentSettings, rentPayments, input.currentDate);
+
+        console.log('🧮 DETERMINISTIC RENT CALCULATION:', {
+            totalRentDue: rentState.totalRentDue,
+            totalPayments: rentState.totalPayments,
+            openingArrears: rentState.openingArrears,
+            currentBalance: rentState.currentBalance,
+            cyclesElapsed: rentState.cyclesElapsed,
+            cyclesPaidInFull: rentState.cyclesPaidInFull,
+            daysOverdue: rentState.daysOverdue,
+            formula: `${rentState.totalRentDue} + ${rentState.openingArrears} - ${rentState.totalPayments} = ${rentState.currentBalance}`,
+            legalEngineBalance: legalAnalysis.analysis.totalArrears,
+            difference: Math.abs(rentState.currentBalance - legalAnalysis.analysis.totalArrears)
+        });
+
+        // SINGLE SOURCE OF TRUTH: Use deterministic calculation
+        totalBalanceDue = rentState.currentBalance;
+        deterministicDaysOverdue = rentState.daysOverdue;
+        deterministicFirstMissedDate = rentState.oldestUnpaidDueDate;
+    } else {
+        // Fallback to legal engine's status-based calculation
+        console.log('⚠️ FALLING BACK TO LEGAL ENGINE BALANCE (missing rentAmount/frequency/rentDueDay/trackingStartDate)');
+        totalBalanceDue = legalAnalysis.analysis.totalArrears;
+    }
 
     // Determine UI status based on legal analysis
     let status: RentalLogicResult['status'] = 'CLEAR';
@@ -812,10 +873,20 @@ export function calculateRentalLogic(input: UseRentalLogicInput): RentalLogicRes
         missedCycleCount = Math.floor(daysSinceFirstMissed / cycleLength) + 1;
     }
 
+    // Use deterministic daysOverdue if available, otherwise fall back to legal engine
+    const effectiveDaysOverdue = deterministicDaysOverdue !== null
+        ? deterministicDaysOverdue
+        : legalAnalysis.analysis.daysArrears;
+
+    // Use deterministic firstMissedDueDate if available
+    const effectiveFirstMissedDueDate = deterministicFirstMissedDate
+        ? deterministicFirstMissedDate.toISOString().split('T')[0]
+        : firstMissedDueDate;
+
     return {
         status,
-        daysOverdue: legalAnalysis.analysis.daysArrears,
-        workingDaysOverdue: legalAnalysis.analysis.workingDaysOverdue,
+        daysOverdue: effectiveDaysOverdue,
+        workingDaysOverdue: legalAnalysis.analysis.workingDaysOverdue, // Keep legal engine for working days (RTA-specific)
         totalBalanceDue,
         eligibleActions,
         strikeCount: legalAnalysis.analysis.strikeCount,
@@ -827,7 +898,7 @@ export function calculateRentalLogic(input: UseRentalLogicInput): RentalLogicRes
         isEligibleSection55_1aa,
         tribunalDeadlineDays, // Days remaining in 28-day filing window (null if N/A, 0 if expired)
         legalAnalysis,
-        firstMissedDueDate, // ANCHORED date - does not float daily
+        firstMissedDueDate: effectiveFirstMissedDueDate, // ANCHORED date - does not float daily
         missedCycleCount, // Number of rent cycles missed (CRITICAL if >= 3)
     };
 }
@@ -874,6 +945,12 @@ export function useRentalLogic(input: UseRentalLogicInput): RentalLogicResult {
             strikesHash,       // Stable hash instead of strikeHistory array reference
             input.region,
             currentDateStr,    // Stable string instead of Date object reference
+            // Deterministic calculation dependencies
+            input.rentAmount,
+            input.frequency,
+            input.rentDueDay,
+            input.trackingStartDate,
+            input.openingArrears,
         ]
         // eslint-disable-next-line react-hooks/exhaustive-deps
     );

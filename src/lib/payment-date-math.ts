@@ -1,7 +1,7 @@
 /**
  * Payment Date Math - Shared Logic for Ledger and Status Resolver
  *
- * This file contains the SINGLE SOURCE OF TRUTH for all date calculations.
+ * This file contains the SINGLE SOURCE OF TRUTH for all PAYMENT date calculations.
  * Both ledger-regenerator.ts and tenant-status-resolver.ts MUST use these
  * functions to ensure consistency.
  *
@@ -10,35 +10,33 @@
  * - Cycle: A single payment period (Weekly, Fortnightly, or Monthly)
  * - Paid Until: The date up to which the tenant has paid (Ground Zero + paid cycles)
  * - Days Overdue: Days from today to the next due date after paid_until
+ *
+ * IMPORTANT: This file uses date-utils.ts for all foundational date operations.
+ * Never import directly from date-fns - use date-utils instead.
  */
 
 import {
-    parseISO,
+    // Core date utilities from our unified module
+    parseDateISO,
+    formatDateDisplay,
+    formatDateISO,
     addDays,
     addWeeks,
     addMonths,
-    differenceInCalendarDays,
-    format,
-    nextDay,
-    setDate,
-    getDate,
-    getDaysInMonth,
+    daysBetween,
+    startOfDay,
     isBefore,
     isAfter,
     isSameDay,
-    startOfDay
-} from "date-fns";
-
-// Day name to date-fns day index (0 = Sunday, 1 = Monday, etc.)
-const DAY_NAME_TO_INDEX: { [key: string]: 0 | 1 | 2 | 3 | 4 | 5 | 6 } = {
-    'Sunday': 0,
-    'Monday': 1,
-    'Tuesday': 2,
-    'Wednesday': 3,
-    'Thursday': 4,
-    'Friday': 5,
-    'Saturday': 6
-};
+    // Day utilities
+    getDayIndexFromName,
+    DAY_NAME_TO_JS_INDEX,
+    // Due date utilities
+    findFirstDueDate as findFirstDueDateUtil,
+    advanceDueDate as advanceDueDateUtil,
+    type DueDateSettings
+} from "./date-utils";
+import { getDaysInMonth, nextDay, format } from "date-fns";
 
 export type PaymentFrequency = 'Weekly' | 'Fortnightly' | 'Monthly';
 
@@ -60,6 +58,18 @@ export interface PaidUntilResult {
 }
 
 /**
+ * Convert DateMathSettings to DueDateSettings for date-utils functions
+ */
+function toDueDateSettings(settings: DateMathSettings): DueDateSettings {
+    return {
+        frequency: settings.frequency,
+        dueDay: settings.frequency === 'Monthly'
+            ? parseInt(settings.rentDueDay, 10) || 1
+            : settings.rentDueDay
+    };
+}
+
+/**
  * Calculate "Ground Zero" - the first valid due day on or after trackingStartDate
  *
  * This is the ANCHOR for all payment calculations. Every due date must fall on
@@ -69,7 +79,7 @@ export interface PaidUntilResult {
  * @returns The Ground Zero date (first valid due day)
  */
 export function calculateGroundZero(settings: DateMathSettings): Date {
-    const trackingStart = startOfDay(parseISO(settings.trackingStartDate));
+    const trackingStart = startOfDay(parseDateISO(settings.trackingStartDate));
 
     console.log('📍 Calculating Ground Zero:', {
         trackingStartDate: settings.trackingStartDate,
@@ -114,7 +124,7 @@ export function calculateGroundZero(settings: DateMathSettings): Date {
     } else {
         // For Weekly/Fortnightly: Find the first occurrence of the target day
         const targetDayName = settings.rentDueDay;
-        const targetDayIndex = DAY_NAME_TO_INDEX[targetDayName];
+        const targetDayIndex = getDayIndexFromName(targetDayName);
 
         if (targetDayIndex === undefined) {
             console.error(`Invalid day name: ${targetDayName}`);
@@ -280,15 +290,18 @@ export function getDueDateForCycle(cycleNumber: number, settings: DateMathSettin
  *    UNLESS Total_Paid > Total_Accrued (genuine credit balance)
  * 3. DUE DAY ANCHOR: paid_until must ALWAYS fall on a valid due day (e.g., Friday)
  *
+ * IMPORTANT: currentDate parameter is REQUIRED. Do not use default = new Date().
+ * Always pass the effective date from the calling context (respecting test date override).
+ *
  * @param outstandingBalance - Current amount owed
  * @param settings - Date math settings
- * @param currentDate - Today's date (for calculating days overdue)
+ * @param currentDate - Today's date (REQUIRED - for calculating days overdue)
  * @returns PaidUntilResult with all metrics
  */
 export function calculatePaidUntilStatus(
     outstandingBalance: number,
     settings: DateMathSettings,
-    currentDate: Date = new Date()
+    currentDate: Date
 ): PaidUntilResult {
     const normalizedCurrentDate = startOfDay(currentDate);
     const groundZero = calculateGroundZero(settings);
@@ -401,7 +414,7 @@ export function calculatePaidUntilStatus(
     // Days overdue = calendar days from next due date to today (if next due date is in the past)
     let daysOverdue = 0;
     if (isBefore(nextDueDate, normalizedCurrentDate) || isSameDay(nextDueDate, normalizedCurrentDate)) {
-        daysOverdue = differenceInCalendarDays(normalizedCurrentDate, nextDueDate);
+        daysOverdue = daysBetween(nextDueDate, normalizedCurrentDate);
     }
 
     const result: PaidUntilResult = {
@@ -518,11 +531,15 @@ export function generateAllDueDates(
  * Verbose debugging output for date calculations
  *
  * Use this to diagnose drift issues.
+ *
+ * @param outstandingBalance - Current amount owed
+ * @param settings - Date math settings
+ * @param currentDate - Today's date (REQUIRED - pass test date or effective date)
  */
 export function debugDateCalculation(
     outstandingBalance: number,
     settings: DateMathSettings,
-    currentDate: Date = new Date()
+    currentDate: Date
 ): void {
     console.log('═══════════════════════════════════════════════════════════════');
     console.log('🔍 DATE MATH DEBUG OUTPUT');

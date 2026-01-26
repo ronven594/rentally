@@ -9,11 +9,26 @@
  * - Section 55(1)(a): 21 Days In Arrears
  * - Section 55A: Anti-social Behaviour (3 Strikes)
  * - Section 56: 14-Day Notice to Remedy
+ *
+ * IMPORTANT: This file uses date-utils.ts for all foundational date operations.
+ * Working day calculations, timezone handling, and core date utilities
+ * are imported from the unified date-utils module.
  */
 
-import { format, addDays, differenceInCalendarDays, getDay, parseISO, isAfter, isBefore, isEqual, startOfDay } from "date-fns";
+import { format, parseISO, isAfter, isBefore, isEqual, startOfDay, differenceInCalendarDays } from "date-fns";
 import { toZonedTime } from "date-fns-tz";
-import { type NZRegion, isNZHoliday } from "@/lib/nz-holidays";
+import { type NZRegion } from "@/lib/nz-holidays";
+
+// Import from unified date-utils module
+import {
+    NZ_TIMEZONE,
+    isNZWorkingDay,
+    getNextWorkingDay,
+    countWorkingDaysBetween,
+    addWorkingDays,
+    addDays,
+    daysBetween
+} from "./date-utils";
 
 // ============================================================================
 // TYPES
@@ -128,57 +143,9 @@ export interface AnalysisResult {
 // ============================================================================
 // WORKING DAY CALCULATIONS
 // ============================================================================
-
-/**
- * Checks if a date is a NZ working day.
- * Working days exclude weekends and all NZ public holidays (national + regional).
- *
- * @param date - The date to check
- * @param region - Optional NZ region for regional anniversary days
- * @returns True if the date is a working day
- */
-export function isNZWorkingDay(date: Date, region?: NZRegion): boolean {
-    const dayOfWeek = getDay(date);
-
-    // Exclude weekends (Saturday = 6, Sunday = 0)
-    if (dayOfWeek === 0 || dayOfWeek === 6) {
-        return false;
-    }
-
-    // Summer blackout period: Dec 25 - Jan 15 (inclusive) - NOT working days per RTA
-    const month = date.getMonth() + 1; // 1-indexed (1 = January, 12 = December)
-    const day = date.getDate();
-
-    if ((month === 12 && day >= 25) || (month === 1 && day <= 15)) {
-        return false;
-    }
-
-    // Check against NZ public holidays
-    const dateStr = format(date, "yyyy-MM-dd");
-    if (isNZHoliday(dateStr, region)) {
-        return false;
-    }
-
-    return true;
-}
-
-/**
- * Gets the next working day from a given date.
- * If the date is already a working day, returns that date.
- *
- * @param date - Starting date
- * @param region - Optional NZ region for regional holidays
- * @returns The next working day
- */
-export function getNextWorkingDay(date: Date, region?: NZRegion): Date {
-    let current = new Date(date);
-
-    while (!isNZWorkingDay(current, region)) {
-        current = addDays(current, 1);
-    }
-
-    return current;
-}
+// NOTE: Core working day functions (isNZWorkingDay, getNextWorkingDay,
+// countWorkingDaysBetween, addWorkingDays) are imported from date-utils.ts
+// ============================================================================
 
 /**
  * Calculates the Official Service Date (OSD) for a notice under RTA Section 136.
@@ -233,6 +200,9 @@ export function calculateServiceDate(sentAt: Date, region?: NZRegion): Date {
     return sentDate;
 }
 
+// Re-export isNZWorkingDay for backwards compatibility with existing imports
+export { isNZWorkingDay, getNextWorkingDay, addWorkingDays } from "./date-utils";
+
 /**
  * Calculates the expiry date for a notice based on RTA requirements.
  *
@@ -278,29 +248,8 @@ export function calculateNoticeExpiryDate(
 }
 
 /**
- * Adds working days to a date (excludes weekends and holidays).
- *
- * @param date - Starting date
- * @param days - Number of working days to add
- * @param region - Optional NZ region for regional holidays
- * @returns Date after adding specified working days
- */
-export function addWorkingDays(date: Date, days: number, region?: NZRegion): Date {
-    let current = new Date(date);
-    let remaining = days;
-
-    while (remaining > 0) {
-        current = addDays(current, 1);
-        if (isNZWorkingDay(current, region)) {
-            remaining--;
-        }
-    }
-
-    return current;
-}
-
-/**
  * Counts working days between two dates (exclusive of start, inclusive of end).
+ * Wrapper around countWorkingDaysBetween from date-utils for backwards compatibility.
  *
  * @param startDate - Start date
  * @param endDate - End date
@@ -308,17 +257,7 @@ export function addWorkingDays(date: Date, days: number, region?: NZRegion): Dat
  * @returns Number of working days between dates
  */
 export function countWorkingDays(startDate: Date, endDate: Date, region?: NZRegion): number {
-    let count = 0;
-    let current = addDays(startDate, 1);
-
-    while (isBefore(current, endDate) || isEqual(current, endDate)) {
-        if (isNZWorkingDay(current, region)) {
-            count++;
-        }
-        current = addDays(current, 1);
-    }
-
-    return count;
+    return countWorkingDaysBetween(startDate, endDate, region);
 }
 
 // ============================================================================
@@ -326,7 +265,7 @@ export function countWorkingDays(startDate: Date, endDate: Date, region?: NZRegi
 // ============================================================================
 
 const EMAIL_CUTOFF_HOUR = 17; // 5:00 PM NZ time
-const NZ_TIMEZONE = "Pacific/Auckland"; // IANA timezone for New Zealand
+// NZ_TIMEZONE is imported from date-utils.ts
 
 /**
  * Calculates the Official Service Date (OSD) for an email notice.

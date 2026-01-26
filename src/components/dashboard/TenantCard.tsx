@@ -12,8 +12,8 @@ import { toZonedTime } from "date-fns-tz"
 import { formatFrequencyLabel } from "@/lib/status-engine"
 import type { RentalLogicResult } from "@/hooks/useRentalLogic"
 
-// NZ Timezone constant for consistent date handling
-const NZ_TIMEZONE = "Pacific/Auckland";
+// Import NZ_TIMEZONE from unified date-utils module (single source of truth)
+import { NZ_TIMEZONE } from "@/lib/date-utils"
 
 /**
  * Calculates the first future due date by rolling forward from a base date.
