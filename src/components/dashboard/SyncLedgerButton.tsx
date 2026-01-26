@@ -20,6 +20,7 @@ interface SyncLedgerButtonProps {
     size?: "default" | "sm" | "lg" | "icon";
     showIcon?: boolean;
     className?: string;
+    onSyncComplete?: () => void; // Callback when sync is complete - use to refresh data
 }
 
 export function SyncLedgerButton({
@@ -28,12 +29,14 @@ export function SyncLedgerButton({
     variant = "outline",
     size = "default",
     showIcon = true,
-    className = ""
+    className = "",
+    onSyncComplete
 }: SyncLedgerButtonProps) {
     const { isSyncing, syncLedger } = useTenantLedgerSync({
         tenantId,
         ...currentSettings,
-        enabled: false // Disable auto-sync, only sync on button click
+        enabled: false, // Disable auto-sync, only sync on button click
+        onSyncComplete
     });
 
     return (

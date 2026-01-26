@@ -3,7 +3,7 @@
  *
  * Takes raw payment records and tenant settings, then intelligently resolves:
  * - Which payments are actually unpaid based on "Amount Behind"
- * - The true overdue date (most recent unpaid)
+ * - The true overdue date (using Ground Zero anchor)
  * - Current balance and days overdue
  *
  * CRITICAL LOGIC:
@@ -13,9 +13,20 @@
  *
  * This matches real-world scenarios where tenants fall behind gradually,
  * not that they never paid from the start.
+ *
+ * USES SHARED DATE MATH:
+ * All date calculations use payment-date-math.ts to ensure consistency
+ * with ledger-regenerator.ts.
  */
 
 import { parseISO, differenceInCalendarDays, format } from "date-fns";
+import {
+    calculateGroundZero,
+    calculatePaidUntilStatus,
+    debugDateCalculation,
+    type DateMathSettings,
+    type PaymentFrequency
+} from "./payment-date-math";
 
 export interface PaymentRecord {
     id: string;
@@ -29,17 +40,22 @@ export interface TenantSettings {
     trackingStartDate: string;
     openingBalance: number; // Amount behind when tracking started
     rentAmount: number;
-    frequency: 'Weekly' | 'Fortnightly' | 'Monthly';
+    frequency: PaymentFrequency;
+    rentDueDay?: string; // Optional - needed for accurate date calculations
 }
 
 export interface ResolvedStatus {
     status: 'Paid Up' | 'Overdue' | 'Warning';
     days: number;
-    dateSince: string | null;
+    dateSince: string | null; // Formatted date string (e.g., "Jan 15")
+    paidUntilDate: string | null; // ISO date string (e.g., "2024-01-15")
+    nextDueDate: string | null; // ISO date string of next unpaid due date
     balance: number;
     unpaidRecords: string[]; // IDs of records that should be marked unpaid
     paidRecords: string[]; // IDs of records that should be marked paid
     partialPayments: Map<string, number>; // Map of payment ID to amount_paid for partial payments
+    cyclesPaid: number;
+    cyclesUnpaid: number;
 }
 
 /**
@@ -55,11 +71,14 @@ export function resolveTenantStatus(
     settings: TenantSettings,
     currentDate: Date = new Date()
 ): ResolvedStatus {
-    const { openingBalance, trackingStartDate } = settings;
+    const { openingBalance, trackingStartDate, rentAmount, frequency } = settings;
 
     console.log('🔍 AI STATUS RESOLVER - Starting resolution:', {
         openingBalance,
         trackingStartDate,
+        rentAmount,
+        frequency,
+        rentDueDay: settings.rentDueDay,
         totalPaymentRecords: payments.length,
         currentDate: format(currentDate, 'yyyy-MM-dd')
     });
@@ -78,6 +97,37 @@ export function resolveTenantStatus(
     );
 
     // ========================================================================
+    // USE SHARED DATE MATH for Paid Until calculation
+    // ========================================================================
+    let paidUntilResult = null;
+    let groundZero = null;
+
+    if (settings.rentDueDay) {
+        const dateMathSettings: DateMathSettings = {
+            trackingStartDate,
+            frequency,
+            rentDueDay: settings.rentDueDay,
+            rentAmount
+        };
+
+        // Debug output for troubleshooting
+        debugDateCalculation(openingBalance, dateMathSettings, currentDate);
+
+        // Calculate Paid Until status using shared math
+        paidUntilResult = calculatePaidUntilStatus(openingBalance, dateMathSettings, currentDate);
+        groundZero = calculateGroundZero(dateMathSettings);
+
+        console.log('🎯 Shared Date Math Result:', {
+            groundZero: format(paidUntilResult.groundZero, 'yyyy-MM-dd'),
+            paidUntilDate: format(paidUntilResult.paidUntilDate, 'yyyy-MM-dd'),
+            nextDueDate: format(paidUntilResult.nextDueDate, 'yyyy-MM-dd'),
+            cyclesPaid: paidUntilResult.cyclesPaid,
+            cyclesUnpaid: paidUntilResult.cyclesUnpaid,
+            daysOverdue: paidUntilResult.daysOverdue
+        });
+    }
+
+    // ========================================================================
     // CRITICAL LOGIC: Opening Balance Resolution
     // ========================================================================
     // If opening balance is $600 and we have payment records totaling $2400,
@@ -89,7 +139,7 @@ export function resolveTenantStatus(
     const totalPotentialDebt = sortedPayments.reduce((sum, p) => sum + p.amount, 0);
 
     // Calculate how much was actually paid (historical payments before falling behind)
-    const historicalPayments = totalPotentialDebt - openingBalance;
+    const historicalPayments = Math.round((totalPotentialDebt - openingBalance) * 100) / 100;
 
     console.log('💰 Debt calculation:', {
         totalPotentialDebt,
@@ -151,25 +201,53 @@ export function resolveTenantStatus(
             .map(p => p.due_date)
     });
 
-    // Find the oldest unpaid payment (earliest due date)
-    const oldestUnpaid = sortedPayments.find(p => unpaidRecords.includes(p.id));
+    // ========================================================================
+    // DETERMINE OVERDUE STATUS using Paid Until calculation
+    // ========================================================================
+    let daysOverdue = 0;
+    let dateSince: string | null = null;
+    let paidUntilDateStr: string | null = null;
+    let nextDueDateStr: string | null = null;
+    let cyclesPaid = 0;
+    let cyclesUnpaid = 0;
 
-    if (!oldestUnpaid) {
-        // No unpaid records - tenant is paid up!
+    if (paidUntilResult) {
+        // Use the shared date math result
+        daysOverdue = paidUntilResult.daysOverdue;
+        paidUntilDateStr = format(paidUntilResult.paidUntilDate, 'yyyy-MM-dd');
+        nextDueDateStr = format(paidUntilResult.nextDueDate, 'yyyy-MM-dd');
+        dateSince = format(paidUntilResult.nextDueDate, 'MMM d');
+        cyclesPaid = paidUntilResult.cyclesPaid;
+        cyclesUnpaid = paidUntilResult.cyclesUnpaid;
+    } else {
+        // Fallback: Use oldest unpaid payment date
+        const oldestUnpaid = sortedPayments.find(p => unpaidRecords.includes(p.id));
+        if (oldestUnpaid) {
+            const oldestUnpaidDate = parseISO(oldestUnpaid.due_date);
+            daysOverdue = differenceInCalendarDays(currentDate, oldestUnpaidDate);
+            dateSince = format(oldestUnpaidDate, 'MMM d');
+            nextDueDateStr = oldestUnpaid.due_date;
+        }
+        cyclesUnpaid = unpaidRecords.length;
+        cyclesPaid = paidRecords.length;
+    }
+
+    // Handle paid up case
+    if (unpaidRecords.length === 0 || openingBalance <= 0) {
         return {
             status: 'Paid Up',
             days: 0,
             dateSince: null,
+            paidUntilDate: paidUntilDateStr,
+            nextDueDate: nextDueDateStr,
             balance: 0,
             unpaidRecords: [],
             paidRecords: sortedPayments.map(p => p.id),
-            partialPayments: new Map()
+            partialPayments: new Map(),
+            cyclesPaid: sortedPayments.length,
+            cyclesUnpaid: 0
         };
     }
-
-    // Calculate days overdue from oldest unpaid date
-    const oldestUnpaidDate = parseISO(oldestUnpaid.due_date);
-    const daysOverdue = differenceInCalendarDays(currentDate, oldestUnpaidDate);
 
     // Determine status based on days overdue
     let status: 'Paid Up' | 'Overdue' | 'Warning' = 'Overdue';
@@ -184,11 +262,15 @@ export function resolveTenantStatus(
     const result: ResolvedStatus = {
         status,
         days: Math.max(0, daysOverdue),
-        dateSince: format(oldestUnpaidDate, 'MMM d'),
+        dateSince,
+        paidUntilDate: paidUntilDateStr,
+        nextDueDate: nextDueDateStr,
         balance: openingBalance,
         unpaidRecords,
         paidRecords,
-        partialPayments
+        partialPayments,
+        cyclesPaid,
+        cyclesUnpaid
     };
 
     console.log('✅ Final resolved status:', {

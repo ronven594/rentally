@@ -22,16 +22,19 @@ import { User, Trash2, CheckCircle2, Mail, Phone, Calendar, Settings2 } from "lu
 import { toast } from "sonner"
 import { useMediaQuery } from "@/hooks/use-media-query"
 import { ConfirmationDialog } from "./ConfirmationDialog"
+import { SyncLedgerButton } from "./SyncLedgerButton"
 
 interface ManageTenantDialogProps {
     open: boolean;
     onOpenChange: (open: boolean) => void;
     tenant: Tenant;
+    propertyId: string;
     onUpdate: (tenantId: string, updates: Partial<Tenant>) => void;
     onDelete: (tenantId: string) => void;
+    onRefreshData?: () => void; // Called when ledger sync completes - use to refresh tenant data
 }
 
-export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDelete }: ManageTenantDialogProps) {
+export function ManageTenantDialog({ open, onOpenChange, tenant, propertyId, onUpdate, onDelete, onRefreshData }: ManageTenantDialogProps) {
     const isDesktop = useMediaQuery("(min-width: 768px)");
 
     // Internal state
@@ -250,9 +253,26 @@ export function ManageTenantDialog({ open, onOpenChange, tenant, onUpdate, onDel
                     <span className="text-xs font-bold uppercase tracking-wider">Remove Tenant</span>
                 </button>
 
-                <Button onClick={handleSave} variant="brand-accent" className="flex-1 h-11 rounded-xl">
-                    Save Changes
-                </Button>
+                <div className="flex items-center gap-2 flex-1">
+                    <SyncLedgerButton
+                        tenantId={tenant.id}
+                        currentSettings={{
+                            trackingStartDate: tenant.trackingStartDate || tenant.startDate || new Date().toISOString().split('T')[0],
+                            rentAmount: Number(amount),
+                            frequency,
+                            rentDueDay,
+                            propertyId
+                        }}
+                        variant="outline"
+                        size="default"
+                        className="h-11 rounded-xl"
+                        onSyncComplete={onRefreshData}
+                    />
+
+                    <Button onClick={handleSave} variant="brand-accent" className="flex-1 h-11 rounded-xl">
+                        Save Changes
+                    </Button>
+                </div>
             </div>
         </div>
     );

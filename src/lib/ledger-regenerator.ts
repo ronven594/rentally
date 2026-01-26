@@ -6,13 +6,23 @@
  * reflect across the entire payment history "as if they had always been in place."
  *
  * CRITICAL: This is the "AI Resolver in Reactive Mode"
+ *
+ * USES SHARED DATE MATH:
+ * All date calculations use payment-date-math.ts to ensure consistency
+ * with tenant-status-resolver.ts.
  */
 
-import { format, parseISO, addDays, addWeeks, addMonths } from "date-fns";
+import { format, parseISO } from "date-fns";
 import { resolveTenantStatus, applyResolvedStatus } from "./tenant-status-resolver";
-import { PaymentFrequency } from "@/types";
-
-const DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+import {
+    calculateGroundZero,
+    generateAllDueDates,
+    calculatePaidUntilStatus,
+    debugDateCalculation,
+    countCyclesToDate,
+    type DateMathSettings,
+    type PaymentFrequency
+} from "./payment-date-math";
 
 export interface TenantSettings {
     id: string;
@@ -29,6 +39,8 @@ export interface LedgerRegenerationResult {
     recordsCreated: number;
     balanceRedistributed: number;
     newOverdueSince: string | null;
+    paidUntilDate: string | null;
+    daysOverdue: number;
     error?: string;
 }
 
@@ -56,128 +68,311 @@ export async function regeneratePaymentLedger(
         currentDate: format(currentDate, 'yyyy-MM-dd')
     });
 
+    // Create DateMathSettings for shared calculations
+    const dateMathSettings: DateMathSettings = {
+        trackingStartDate: newSettings.trackingStartDate,
+        frequency: newSettings.frequency,
+        rentDueDay: newSettings.rentDueDay,
+        rentAmount: newSettings.rentAmount
+    };
+
+    // Show verbose debug output
+    console.log('');
+    console.log('═══════════════════════════════════════════════════════════════');
+    console.log('🔧 LEDGER REGENERATOR - Using Shared Date Math');
+    console.log('═══════════════════════════════════════════════════════════════');
+
+    // Calculate Ground Zero using shared logic
+    const groundZero = calculateGroundZero(dateMathSettings);
+    console.log(`📍 Ground Zero: ${format(groundZero, 'yyyy-MM-dd (EEEE)')}`);
+
     try {
         // =====================================================================
-        // STEP 1: Calculate total paid and current balance
+        // STEP 1: CALCULATE THE "CASH PAID" ANCHOR BEFORE ANY CHANGES
         // =====================================================================
-        // CRITICAL: We must preserve the total amount PAID when regenerating
-        // This prevents "Balance Drift" when settings change
-        const { data: currentPayments, error: fetchError } = await supabaseClient
+        // CRITICAL FIX (Historical Accrual Bug):
+        // When rent changes from $400 to $405, we CANNOT just use amount_paid from
+        // Paid records - if records are marked Unpaid, that data is lost!
+        //
+        // Instead, we derive cash paid from:
+        //   Cash_Paid = Total_Accrued_At_Old_Rate - Current_Outstanding_Balance
+        //
+        // This ensures we preserve the tenant's actual payment history regardless
+        // of how records are marked.
+        // =====================================================================
+
+        // First, fetch ALL records to understand current state
+        const { data: allRecords, error: fetchAllError } = await supabaseClient
             .from('payments')
             .select('*')
-            .eq('tenant_id', tenantId)
-            .gte('due_date', newSettings.trackingStartDate);
+            .eq('tenant_id', tenantId);
 
-        if (fetchError) {
-            console.error('❌ Failed to fetch current payments:', fetchError);
+        if (fetchAllError) {
+            console.error('❌ Failed to fetch all payments:', fetchAllError);
             return {
                 success: false,
                 recordsDeleted: 0,
                 recordsCreated: 0,
                 balanceRedistributed: 0,
                 newOverdueSince: null,
-                error: fetchError.message
+                paidUntilDate: null,
+                daysOverdue: 0,
+                error: fetchAllError.message
             };
         }
 
+        // Get the OLD rent amount from existing records (before the change)
+        // All existing records should have the same amount (old rent)
+        const oldRentAmount = allRecords && allRecords.length > 0
+            ? allRecords[0].amount
+            : newSettings.rentAmount;
+
+        // Calculate the CURRENT OUTSTANDING BALANCE from existing records
+        // This is: Total Owed - Total Paid = sum(amount) - sum(amount_paid)
+        const totalOwedFromRecords = (allRecords || []).reduce(
+            (sum: number, p: any) => sum + (p.amount || 0), 0
+        );
+        const totalPaidFromRecords = (allRecords || []).reduce(
+            (sum: number, p: any) => sum + (p.amount_paid || 0), 0
+        );
+        const currentOutstandingBalance = Math.round((totalOwedFromRecords - totalPaidFromRecords) * 100) / 100;
+
+        // Create OLD date math settings for calculating cycles at old rate
+        const oldDateMathSettings: DateMathSettings = {
+            trackingStartDate: newSettings.trackingStartDate,
+            frequency: newSettings.frequency,
+            rentDueDay: newSettings.rentDueDay,
+            rentAmount: oldRentAmount
+        };
+
+        // Calculate total cycles from tracking start to today
+        const totalCycles = countCyclesToDate(currentDate, dateMathSettings);
+
+        // Calculate what SHOULD have been accrued at the OLD rate
+        const totalAccruedAtOldRate = Math.round(totalCycles * oldRentAmount * 100) / 100;
+
         // =====================================================================
-        // CASH-BASIS ANCHOR: Calculate ground truth before regeneration
+        // THE CASH PAID ANCHOR
         // =====================================================================
-        // CRITICAL: Count CYCLES, don't sum amounts (amounts may vary from previous changes)
-        // Number of cycles = number of payment records from tracking start to today
-        const numberOfCycles = currentPayments.length;
+        // This is the CRITICAL calculation:
+        // Cash_Paid = What_Was_Accrued - What_Is_Still_Owed
+        //
+        // Example: 7 cycles at $400 = $2800 accrued, $800 balance
+        //          Cash Paid = $2800 - $800 = $2000
+        //
+        // This $2000 is the ANCHOR - it's the actual money the tenant handed over
+        // and it MUST be preserved when rent changes!
+        // =====================================================================
+        const cashPaidByTenant = Math.round((totalAccruedAtOldRate - currentOutstandingBalance) * 100) / 100;
 
-        // Get the OLD rent amount from the first record (before the change)
-        // All records should have the same old amount
-        const oldRentAmount = numberOfCycles > 0 ? currentPayments[0].amount : newSettings.rentAmount;
+        console.log('═══════════════════════════════════════════════════════════════');
+        console.log('💰 CASH PAID ANCHOR CALCULATION (Historical Accrual Fix)');
+        console.log('═══════════════════════════════════════════════════════════════');
+        console.log('📊 Old State (Before Rent Change):');
+        console.log(`   - Old Rent Amount: $${oldRentAmount.toFixed(2)}`);
+        console.log(`   - Total Cycles: ${totalCycles}`);
+        console.log(`   - Total Accrued (at old rate): $${totalAccruedAtOldRate.toFixed(2)}`);
+        console.log(`   - Current Outstanding Balance: $${currentOutstandingBalance.toFixed(2)}`);
+        console.log('');
+        console.log('💵 CASH PAID ANCHOR:');
+        console.log(`   - Cash Paid by Tenant: $${cashPaidByTenant.toFixed(2)}`);
+        console.log(`   - Formula: $${totalAccruedAtOldRate.toFixed(2)} - $${currentOutstandingBalance.toFixed(2)} = $${cashPaidByTenant.toFixed(2)}`);
+        console.log(`   - This represents actual money received from tenant`);
+        console.log('═══════════════════════════════════════════════════════════════');
 
-        // Calculate old accrued rent based on CYCLES × OLD RENT AMOUNT
-        // This is the "ground truth" - what SHOULD have been paid with old settings
-        const oldAccruedRent = Math.round(numberOfCycles * oldRentAmount * 100) / 100;
+        // Separate Paid records from Unpaid/Partial/Projected for deletion tracking
+        const paidRecords = (allRecords || []).filter((p: any) => p.status === 'Paid');
+        const unpaidRecords = (allRecords || []).filter((p: any) =>
+            p.status === 'Unpaid' || p.status === 'Partial' || p.status === 'Projected'
+        );
 
-        // Calculate current unpaid balance
-        const currentBalance = currentPayments
-            .filter((p: any) => p.status === 'Unpaid' || p.status === 'Partial')
-            .reduce((sum: number, p: any) => sum + (p.amount - p.amount_paid), 0);
-
-        // CRITICAL: Calculate TOTAL PAID CASH using the anchor formula
-        // Total Paid Cash = Total Accrued (old) - Current Outstanding Balance
-        // This represents the actual cash the tenant has paid
-        const totalPaidCash = Math.round((oldAccruedRent - currentBalance) * 100) / 100;
-
-        console.log('💰 Cash-Basis Anchor - Pre-regeneration ground truth:', {
-            numberOfCycles,
-            oldRentAmount,
-            oldAccruedRent: `${numberOfCycles} cycles × $${oldRentAmount} = $${oldAccruedRent}`,
-            currentBalance,
-            totalPaidCash,
-            formula: `Total Paid Cash = $${oldAccruedRent} (${numberOfCycles} cycles × $${oldRentAmount}) - $${currentBalance} (owing) = $${totalPaidCash}`,
-            verification: `$${totalPaidCash} paid + $${currentBalance} owing = $${totalPaidCash + currentBalance} (should equal $${oldAccruedRent})`
+        console.log('📋 Record Analysis:', {
+            totalRecords: allRecords?.length || 0,
+            paidRecords: paidRecords.length,
+            unpaidRecords: unpaidRecords.length,
+            oldRentAmount: `$${oldRentAmount.toFixed(2)}`,
+            newRentAmount: `$${newSettings.rentAmount.toFixed(2)}`,
+            rentChanged: oldRentAmount !== newSettings.rentAmount
         });
 
         // =====================================================================
-        // STEP 2: Delete all existing payment records from tracking start
+        // STEP 2: Delete ONLY Unpaid/Partial/Projected records
         // =====================================================================
-        // We wipe the slate clean and regenerate based on new settings
-        const { error: deleteError } = await supabaseClient
-            .from('payments')
-            .delete()
-            .eq('tenant_id', tenantId)
-            .gte('due_date', newSettings.trackingStartDate);
+        // CRITICAL: Paid records survive the atomic wipe!
 
-        if (deleteError) {
-            console.error('❌ Failed to delete existing payments:', deleteError);
-            return {
-                success: false,
-                recordsDeleted: 0,
-                recordsCreated: 0,
-                balanceRedistributed: 0,
-                newOverdueSince: null,
-                error: deleteError.message
-            };
+        if (unpaidRecords.length > 0) {
+            const unpaidIds = unpaidRecords.map((p: any) => p.id);
+
+            const { error: deleteError } = await supabaseClient
+                .from('payments')
+                .delete()
+                .in('id', unpaidIds);
+
+            if (deleteError) {
+                console.error('❌ Failed to delete unpaid payments:', deleteError);
+                return {
+                    success: false,
+                    recordsDeleted: 0,
+                    recordsCreated: 0,
+                    balanceRedistributed: 0,
+                    newOverdueSince: null,
+                    paidUntilDate: null,
+                    daysOverdue: 0,
+                    error: deleteError.message
+                };
+            }
+
+            console.log('🗑️ Deleted Unpaid/Partial/Projected records:', {
+                recordsDeleted: unpaidRecords.length,
+                preservedPaidRecords: paidRecords.length
+            });
+        } else {
+            console.log('ℹ️ No Unpaid/Partial/Projected records to delete');
         }
 
-        console.log('🗑️ Deleted existing payment records:', {
-            recordsDeleted: currentPayments.length
-        });
-
-        // Verify deletion - check for ghost records
+        // Verify deletion - check for ghost records (excluding Paid)
         const { data: ghostCheck } = await supabaseClient
             .from('payments')
-            .select('id, due_date, amount')
+            .select('id, due_date, amount, status')
             .eq('tenant_id', tenantId)
-            .gte('due_date', newSettings.trackingStartDate);
+            .in('status', ['Unpaid', 'Partial', 'Projected']);
 
         if (ghostCheck && ghostCheck.length > 0) {
             console.error('⚠️ GHOST RECORDS DETECTED - deletion failed!', {
                 remainingRecords: ghostCheck.length,
                 records: ghostCheck
             });
-            throw new Error(`Ghost records detected: ${ghostCheck.length} records remain after deletion`);
+            throw new Error(`Ghost records detected: ${ghostCheck.length} Unpaid/Partial/Projected records remain after deletion`);
         }
 
-        console.log('✅ Ghost record check passed - slate is clean');
+        console.log('✅ Ghost record check passed - only Paid records remain');
 
-        // =====================================================================
-        // STEP 3: Generate ALL payment records with NEW settings
-        // =====================================================================
-        const allDueDates = generatePaymentDates(
-            newSettings.trackingStartDate,
-            newSettings.frequency,
-            newSettings.rentDueDay,
-            currentDate
+        // Also delete any Paid records that fall BEFORE the new tracking start date
+        // (These are historical records that are no longer relevant)
+        const { data: oldPaidRecords } = await supabaseClient
+            .from('payments')
+            .select('id')
+            .eq('tenant_id', tenantId)
+            .eq('status', 'Paid')
+            .lt('due_date', newSettings.trackingStartDate);
+
+        if (oldPaidRecords && oldPaidRecords.length > 0) {
+            await supabaseClient
+                .from('payments')
+                .delete()
+                .in('id', oldPaidRecords.map((p: any) => p.id));
+
+            console.log('🗑️ Deleted old Paid records before tracking start:', {
+                count: oldPaidRecords.length
+            });
+        }
+
+        // Get the final count of surviving Paid records within tracking period
+        const { data: survivingPaidRecords } = await supabaseClient
+            .from('payments')
+            .select('*')
+            .eq('tenant_id', tenantId)
+            .eq('status', 'Paid')
+            .gte('due_date', newSettings.trackingStartDate);
+
+        const finalTotalPaid = (survivingPaidRecords || []).reduce((sum: number, p: any) =>
+            sum + (p.amount_paid || p.amount), 0
         );
 
-        console.log('📅 Generated payment dates with new settings:', {
-            totalDates: allDueDates.length,
-            firstDate: allDueDates.length > 0 ? format(allDueDates[0], 'yyyy-MM-dd') : 'None',
-            lastDate: allDueDates.length > 0 ? format(allDueDates[allDueDates.length - 1], 'yyyy-MM-dd') : 'None',
-            newRentAmount: newSettings.rentAmount,
-            newFrequency: newSettings.frequency
+        console.log('💵 Final Paid Record Summary:', {
+            survivingPaidRecords: survivingPaidRecords?.length || 0,
+            totalActuallyPaid: `$${finalTotalPaid.toFixed(2)}`
         });
 
-        // Create all payment records as Unpaid initially
-        const allPaymentRecords = allDueDates.map(dueDate => ({
+        // =====================================================================
+        // STEP 3: Generate ALL payment records with NEW settings using SHARED DATE MATH
+        // =====================================================================
+        const allDueDates = generateAllDueDates(dateMathSettings, currentDate);
+
+        console.log('📅 Generated payment dates with SHARED DATE MATH:', {
+            totalDates: allDueDates.length,
+            groundZero: format(groundZero, 'yyyy-MM-dd (EEEE)'),
+            firstDate: allDueDates.length > 0 ? format(allDueDates[0], 'yyyy-MM-dd (EEEE)') : 'None',
+            lastDate: allDueDates.length > 0 ? format(allDueDates[allDueDates.length - 1], 'yyyy-MM-dd (EEEE)') : 'None',
+            newRentAmount: newSettings.rentAmount,
+            newFrequency: newSettings.frequency,
+            newRentDueDay: newSettings.rentDueDay
+        });
+
+        // Validate all dates fall on the correct day
+        if (allDueDates.length > 0) {
+            console.log('🔍 Validating due date grid alignment:');
+            allDueDates.slice(0, 5).forEach((date, index) => {
+                console.log(`   Cycle ${index + 1}: ${format(date, 'yyyy-MM-dd')} (${format(date, 'EEEE')})`);
+            });
+            if (allDueDates.length > 5) {
+                console.log(`   ... and ${allDueDates.length - 5} more cycles`);
+            }
+        }
+
+        // =====================================================================
+        // STEP 4: Calculate NEW outstanding balance using CASH PAID ANCHOR
+        // =====================================================================
+        // CRITICAL FORMULA (Historical Accrual Fix):
+        //
+        // We use the CASH PAID ANCHOR calculated in Step 1, NOT amount_paid from records!
+        //
+        // New_Total_Accrued = Number of cycles × NEW Rent Amount
+        // New_Outstanding_Balance = New_Total_Accrued - Cash_Paid_By_Tenant
+        //
+        // Example: 7 cycles, rent changes from $400 to $405
+        //   Old: 7 × $400 = $2800 accrued, $800 balance, so Cash Paid = $2000
+        //   New: 7 × $405 = $2835 accrued
+        //   New Balance = $2835 - $2000 = $835 (NOT $3000!)
+        //
+        // This ensures we preserve the tenant's actual payment history!
+        // =====================================================================
+
+        const totalAccruedAtNewRate = Math.round(allDueDates.length * newSettings.rentAmount * 100) / 100;
+        const newOutstandingBalance = Math.round((totalAccruedAtNewRate - cashPaidByTenant) * 100) / 100;
+
+        console.log('═══════════════════════════════════════════════════════════════');
+        console.log('🧮 NEW BALANCE CALCULATION (Using Cash Paid Anchor)');
+        console.log('═══════════════════════════════════════════════════════════════');
+        console.log('📊 New State (After Rent Change):');
+        console.log(`   - New Rent Amount: $${newSettings.rentAmount.toFixed(2)}`);
+        console.log(`   - Total Cycles: ${allDueDates.length}`);
+        console.log(`   - Total Accrued (at new rate): $${totalAccruedAtNewRate.toFixed(2)}`);
+        console.log(`   - Cash Paid by Tenant (preserved): $${cashPaidByTenant.toFixed(2)}`);
+        console.log('');
+        console.log('💰 NEW OUTSTANDING BALANCE:');
+        console.log(`   - New Balance: $${newOutstandingBalance.toFixed(2)}`);
+        console.log(`   - Formula: $${totalAccruedAtNewRate.toFixed(2)} - $${cashPaidByTenant.toFixed(2)} = $${newOutstandingBalance.toFixed(2)}`);
+        console.log(`   - Cycles Behind: ${Math.ceil(newOutstandingBalance / newSettings.rentAmount)}`);
+        if (oldRentAmount !== newSettings.rentAmount) {
+            const oldCyclesBehind = Math.ceil(currentOutstandingBalance / oldRentAmount);
+            const newCyclesBehind = Math.ceil(newOutstandingBalance / newSettings.rentAmount);
+            console.log('');
+            console.log('📈 RENT CHANGE IMPACT:');
+            console.log(`   - Old: ${oldCyclesBehind} cycles × $${oldRentAmount.toFixed(2)} = $${currentOutstandingBalance.toFixed(2)}`);
+            console.log(`   - New: ~${newCyclesBehind} cycles × $${newSettings.rentAmount.toFixed(2)} = $${newOutstandingBalance.toFixed(2)}`);
+            console.log(`   - Difference: $${(newOutstandingBalance - currentOutstandingBalance).toFixed(2)}`);
+        }
+        console.log('═══════════════════════════════════════════════════════════════');
+
+        // Determine how many cycles are paid vs unpaid using cash paid
+        const cyclesPaidAtNewRate = Math.floor(cashPaidByTenant / newSettings.rentAmount);
+        const cyclesUnpaid = Math.max(0, allDueDates.length - cyclesPaidAtNewRate);
+
+        console.log('📊 Cycle Distribution:', {
+            totalCycles: allDueDates.length,
+            cyclesPaid: cyclesPaidAtNewRate,
+            cyclesUnpaid,
+            partialPayment: cashPaidByTenant % newSettings.rentAmount > 0.01
+                ? `$${(cashPaidByTenant % newSettings.rentAmount).toFixed(2)}`
+                : 'None'
+        });
+
+        // Create NEW Unpaid records ONLY for cycles that haven't been paid
+        // Start from the (cyclesPaidAtNewRate + 1)th cycle onwards
+        const unpaidDueDates = allDueDates.slice(cyclesPaidAtNewRate);
+
+        const allPaymentRecords = unpaidDueDates.map(dueDate => ({
             tenant_id: tenantId,
             property_id: newSettings.propertyId,
             due_date: format(dueDate, 'yyyy-MM-dd'),
@@ -187,62 +382,70 @@ export async function regeneratePaymentLedger(
             paid_date: null
         }));
 
-        const { data: insertedPayments, error: insertError } = await supabaseClient
-            .from('payments')
-            .insert(allPaymentRecords)
-            .select();
+        let insertedPayments: any[] = [];
 
-        if (insertError) {
-            console.error('❌ Failed to insert new payment records:', insertError);
-            return {
-                success: false,
-                recordsDeleted: currentPayments.length,
-                recordsCreated: 0,
-                balanceRedistributed: 0,
-                newOverdueSince: null,
-                error: insertError.message
-            };
+        if (allPaymentRecords.length > 0) {
+            const { data: inserted, error: insertError } = await supabaseClient
+                .from('payments')
+                .insert(allPaymentRecords)
+                .select();
+
+            if (insertError) {
+                console.error('❌ Failed to insert new payment records:', insertError);
+                return {
+                    success: false,
+                    recordsDeleted: unpaidRecords.length,
+                    recordsCreated: 0,
+                    balanceRedistributed: 0,
+                    newOverdueSince: null,
+                    paidUntilDate: null,
+                    daysOverdue: 0,
+                    error: insertError.message
+                };
+            }
+
+            insertedPayments = inserted || [];
         }
 
-        console.log('✅ Created new payment records:', {
-            recordsCreated: insertedPayments.length
+        console.log('✅ Created new Unpaid payment records:', {
+            recordsCreated: insertedPayments.length,
+            expectedUnpaidCycles: cyclesUnpaid,
+            match: insertedPayments.length === cyclesUnpaid ? '✅ MATCH' : '⚠️ MISMATCH'
         });
 
-        // =====================================================================
-        // STEP 4: Calculate NEW accrued rent and outstanding balance
-        // =====================================================================
-        // CRITICAL FORMULA:
-        // New Accrued Rent = Total of all new records (with new rent amount)
-        // New Outstanding Balance = New Accrued Rent - Total Paid
-        //
-        // Example: Rent changes from $405 to $400, tenant has paid $1620
-        // - Old: 4 periods x $405 = $1620 accrued, $1620 paid, $0 owing
-        // - New: 4 periods x $400 = $1600 accrued, $1620 paid, -$20 owing (CREDIT!)
-        //
-        // This is CORRECT! Tenant overpaid by $20 when rent was higher.
-        // =====================================================================
+        // Combine surviving paid records with new unpaid records for full picture
+        const allCurrentRecords = [
+            ...(survivingPaidRecords || []),
+            ...insertedPayments
+        ].sort((a: any, b: any) => a.due_date.localeCompare(b.due_date));
 
-        const newAccruedRent = insertedPayments.reduce((sum: number, p: any) => sum + p.amount, 0);
+        // =====================================================================
+        // CALCULATE PAID UNTIL STATUS using SHARED DATE MATH
+        // =====================================================================
+        let paidUntilDate: string | null = null;
+        let daysOverdue = 0;
 
-        // CRITICAL: Round to cents to prevent floating point errors
-        // This prevents $0.01 errors from triggering extra cycles
-        const newOutstandingBalance = Math.round((newAccruedRent - totalPaidCash) * 100) / 100;
+        if (newOutstandingBalance > 0) {
+            // Debug the new balance calculation
+            debugDateCalculation(newOutstandingBalance, dateMathSettings, currentDate);
 
-        console.log('🧮 Balance recalculation:', {
-            oldAccruedRent,
-            newAccruedRent,
-            totalPaidCash,
-            oldOutstanding: currentBalance,
-            newOutstanding: newOutstandingBalance,
-            difference: Math.round((newOutstandingBalance - currentBalance) * 100) / 100,
-            oldCycles: Math.round((currentBalance / (oldAccruedRent / currentPayments.length)) * 10) / 10,
-            newCycles: Math.round((newOutstandingBalance / newSettings.rentAmount) * 10) / 10,
-            interpretation: newOutstandingBalance < 0
-                ? `Tenant has CREDIT of $${Math.abs(newOutstandingBalance).toFixed(2)}`
-                : newOutstandingBalance === 0
-                ? 'Tenant is paid up'
-                : `Tenant owes $${newOutstandingBalance.toFixed(2)}`
-        });
+            const paidUntilStatus = calculatePaidUntilStatus(
+                newOutstandingBalance,
+                dateMathSettings,
+                currentDate
+            );
+
+            paidUntilDate = format(paidUntilStatus.paidUntilDate, 'yyyy-MM-dd');
+            daysOverdue = paidUntilStatus.daysOverdue;
+
+            console.log('📊 Paid Until Status (from shared math):', {
+                paidUntilDate: format(paidUntilStatus.paidUntilDate, 'yyyy-MM-dd (EEEE)'),
+                nextDueDate: format(paidUntilStatus.nextDueDate, 'yyyy-MM-dd (EEEE)'),
+                cyclesPaid: paidUntilStatus.cyclesPaid,
+                cyclesUnpaid: paidUntilStatus.cyclesUnpaid,
+                daysOverdue: paidUntilStatus.daysOverdue
+            });
+        }
 
         // =====================================================================
         // STEP 5: Use AI Resolver to redistribute the balance
@@ -262,32 +465,44 @@ export async function regeneratePaymentLedger(
                     trackingStartDate: newSettings.trackingStartDate,
                     openingBalance: newOutstandingBalance, // Use NEW calculated balance, not old!
                     rentAmount: newSettings.rentAmount,
-                    frequency: newSettings.frequency
+                    frequency: newSettings.frequency,
+                    rentDueDay: newSettings.rentDueDay
                 },
                 currentDate
             );
 
-            console.log('🎯 Resolver result:', resolvedStatus);
+            console.log('🎯 Resolver result:', {
+                status: resolvedStatus.status,
+                days: resolvedStatus.days,
+                dateSince: resolvedStatus.dateSince,
+                paidUntilDate: resolvedStatus.paidUntilDate,
+                cyclesPaid: resolvedStatus.cyclesPaid,
+                cyclesUnpaid: resolvedStatus.cyclesUnpaid
+            });
 
             // Apply the resolved status
             await applyResolvedStatus(resolvedStatus, supabaseClient);
 
             console.log('✅ Ledger regeneration complete:', {
-                recordsDeleted: currentPayments.length,
+                recordsDeleted: unpaidRecords.length,
                 recordsCreated: insertedPayments.length,
-                oldBalance: currentBalance,
+                paidRecordsPreserved: survivingPaidRecords?.length || 0,
+                cashPaidByTenant: cashPaidByTenant,
                 newBalance: newOutstandingBalance,
-                balanceChange: newOutstandingBalance - currentBalance,
                 newOverdueSince: resolvedStatus.dateSince,
+                paidUntilDate: resolvedStatus.paidUntilDate,
+                daysOverdue: resolvedStatus.days,
                 newStatus: resolvedStatus.status
             });
 
             return {
                 success: true,
-                recordsDeleted: currentPayments.length,
+                recordsDeleted: unpaidRecords.length,
                 recordsCreated: insertedPayments.length,
                 balanceRedistributed: newOutstandingBalance,
-                newOverdueSince: resolvedStatus.dateSince
+                newOverdueSince: resolvedStatus.dateSince,
+                paidUntilDate: resolvedStatus.paidUntilDate,
+                daysOverdue: resolvedStatus.days
             };
         } else if (newOutstandingBalance <= 0 && insertedPayments && insertedPayments.length > 0) {
             // Tenant has paid up or has credit - mark ALL records as paid
@@ -312,35 +527,48 @@ export async function regeneratePaymentLedger(
                 }
             }
 
+            // Calculate paid until date for fully paid tenant
+            const lastDueDate = insertedPayments.length > 0
+                ? insertedPayments[insertedPayments.length - 1].due_date
+                : null;
+
             console.log('✅ Ledger regeneration complete (tenant paid up/credit):', {
-                recordsDeleted: currentPayments.length,
+                recordsDeleted: unpaidRecords.length,
                 recordsCreated: insertedPayments.length,
-                oldBalance: currentBalance,
+                paidRecordsPreserved: survivingPaidRecords?.length || 0,
+                cashPaidByTenant: cashPaidByTenant,
                 newBalance: newOutstandingBalance,
-                creditAmount: newOutstandingBalance < 0 ? Math.abs(newOutstandingBalance) : 0
+                creditAmount: newOutstandingBalance < 0 ? Math.abs(newOutstandingBalance) : 0,
+                paidUntilDate: lastDueDate
             });
 
             return {
                 success: true,
-                recordsDeleted: currentPayments.length,
+                recordsDeleted: unpaidRecords.length,
                 recordsCreated: insertedPayments.length,
                 balanceRedistributed: 0,
-                newOverdueSince: null
+                newOverdueSince: null,
+                paidUntilDate: lastDueDate,
+                daysOverdue: 0
             };
         } else {
             // No payments generated - edge case
             console.log('✅ Ledger regeneration complete (no payments):', {
-                recordsDeleted: currentPayments.length,
+                recordsDeleted: unpaidRecords.length,
                 recordsCreated: 0,
+                paidRecordsPreserved: survivingPaidRecords?.length || 0,
+                cashPaidByTenant: cashPaidByTenant,
                 balanceRedistributed: 0
             });
 
             return {
                 success: true,
-                recordsDeleted: currentPayments.length,
+                recordsDeleted: unpaidRecords.length,
                 recordsCreated: 0,
                 balanceRedistributed: 0,
-                newOverdueSince: null
+                newOverdueSince: null,
+                paidUntilDate: null,
+                daysOverdue: 0
             };
         }
     } catch (error: any) {
@@ -351,87 +579,11 @@ export async function regeneratePaymentLedger(
             recordsCreated: 0,
             balanceRedistributed: 0,
             newOverdueSince: null,
+            paidUntilDate: null,
+            daysOverdue: 0,
             error: error.message
         };
     }
-}
-
-/**
- * Generate all payment due dates from tracking start to current date
- *
- * @param trackingStartDate - ISO date string when tracking began
- * @param frequency - Payment frequency
- * @param rentDueDay - Due day (day of week for Weekly/Fortnightly, day of month for Monthly)
- * @param currentDate - Current date to generate up to
- * @returns Array of Date objects representing due dates
- */
-function generatePaymentDates(
-    trackingStartDate: string,
-    frequency: PaymentFrequency,
-    rentDueDay: string,
-    currentDate: Date
-): Date[] {
-    const allDueDates: Date[] = [];
-    const trackingStart = parseISO(trackingStartDate);
-    let currentDueDate: Date;
-
-    // Find first due date based on frequency
-    if (frequency === 'Monthly') {
-        const dayOfMonth = parseInt(rentDueDay, 10) || 1;
-        const trackingMonth = trackingStart.getMonth();
-        const trackingYear = trackingStart.getFullYear();
-
-        const lastDayOfMonth = new Date(trackingYear, trackingMonth + 1, 0).getDate();
-        const effectiveDay = Math.min(dayOfMonth, lastDayOfMonth);
-        currentDueDate = new Date(trackingYear, trackingMonth, effectiveDay);
-
-        if (currentDueDate < trackingStart) {
-            const nextMonth = addMonths(currentDueDate, 1);
-            const nextMonthLastDay = new Date(nextMonth.getFullYear(), nextMonth.getMonth() + 1, 0).getDate();
-            const nextMonthEffectiveDay = Math.min(dayOfMonth, nextMonthLastDay);
-            currentDueDate = new Date(nextMonth.getFullYear(), nextMonth.getMonth(), nextMonthEffectiveDay);
-        }
-    } else {
-        // For Weekly/Fortnightly
-        const targetDayIndex = DAYS_OF_WEEK.indexOf(rentDueDay);
-        const targetJsDay = targetDayIndex === 6 ? 0 : targetDayIndex + 1;
-        const trackingStartJsDay = trackingStart.getDay();
-
-        let daysToAdd = (targetJsDay - trackingStartJsDay + 7) % 7;
-        currentDueDate = addDays(trackingStart, daysToAdd);
-    }
-
-    // Generate all due dates up to current date
-    const maxIterations = 520;
-    let iterations = 0;
-
-    while (currentDueDate <= currentDate && iterations < maxIterations) {
-        allDueDates.push(new Date(currentDueDate));
-        iterations++;
-
-        // Advance by frequency
-        if (frequency === 'Weekly') {
-            currentDueDate = addWeeks(currentDueDate, 1);
-        } else if (frequency === 'Fortnightly') {
-            currentDueDate = addWeeks(currentDueDate, 2);
-        } else if (frequency === 'Monthly') {
-            const dayOfMonth = parseInt(rentDueDay, 10) || 1;
-            const nextMonth = addMonths(currentDueDate, 1);
-            const lastDayOfNextMonth = new Date(
-                nextMonth.getFullYear(),
-                nextMonth.getMonth() + 1,
-                0
-            ).getDate();
-            const effectiveDay = Math.min(dayOfMonth, lastDayOfNextMonth);
-            currentDueDate = new Date(
-                nextMonth.getFullYear(),
-                nextMonth.getMonth(),
-                effectiveDay
-            );
-        }
-    }
-
-    return allDueDates;
 }
 
 /**

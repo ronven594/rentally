@@ -1413,6 +1413,7 @@ export default function RentTrackerPage() {
     }, [properties, tenantLegalStatuses]);
 
     const managingTenant = properties.flatMap(p => p.tenants).find(t => t.id === managingTenantId);
+    const managingTenantPropertyId = properties.find(p => p.tenants.some(t => t.id === managingTenantId))?.id || "";
     const totalTenants = properties.reduce((acc, p) => acc + p.tenants.length, 0);
 
     return (
@@ -1574,8 +1575,10 @@ export default function RentTrackerPage() {
                         open={!!managingTenantId}
                         onOpenChange={(open) => !open && setManagingTenantId(null)}
                         tenant={managingTenant}
+                        propertyId={managingTenantPropertyId}
                         onUpdate={handleUpdateTenant}
                         onDelete={() => handleDeleteTenant(managingTenantId!)}
+                        onRefreshData={fetchProperties}
                     />
                 )}
 

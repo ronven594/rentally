@@ -6,12 +6,11 @@
  *
  * RACE CONDITION FIX:
  * - Provides loading state via isSyncing
- * - Waits for regeneration to complete via realtime subscription
- * - Only refreshes UI after confirmation from database
+ * - Waits for regeneration to complete via database wait
+ * - Only triggers onSyncComplete after confirmation
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { regeneratePaymentLedger, shouldRegenerateLedger, TenantSettings } from "@/lib/ledger-regenerator";
 import { supabase } from "@/lib/supabaseClient";
 import { toast } from "sonner";
@@ -25,6 +24,7 @@ export interface UseTenantLedgerSyncOptions {
     rentDueDay: string;
     propertyId: string;
     enabled?: boolean; // Allow disabling the sync (e.g., during form initialization)
+    onSyncComplete?: () => void; // Callback when sync is complete - use this to refresh data
 }
 
 export interface UseTenantLedgerSyncReturn {
@@ -61,10 +61,10 @@ export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTen
         frequency,
         rentDueDay,
         propertyId,
-        enabled = true
+        enabled = true,
+        onSyncComplete
     } = options;
 
-    const queryClient = useQueryClient();
     const [isSyncing, setIsSyncing] = useState(false);
     const channelRef = useRef<RealtimeChannel | null>(null);
     const previousSettingsRef = useRef<TenantSettings | null>(null);
@@ -127,22 +127,13 @@ export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTen
             console.log('⏳ Waiting for database sync...');
             await waitForDatabaseSync();
 
-            // Step 3: Invalidate queries to force fresh data fetch
-            console.log('🔄 Invalidating queries to refresh UI...');
-            await Promise.all([
-                queryClient.invalidateQueries({ queryKey: ['tenant', tenantId] }),
-                queryClient.invalidateQueries({ queryKey: ['payments', tenantId] }),
-                queryClient.invalidateQueries({ queryKey: ['tenants'] })
-            ]);
+            // Step 3: Trigger callback to refresh UI
+            console.log('🔄 Triggering UI refresh callback...');
+            if (onSyncComplete) {
+                onSyncComplete();
+            }
 
-            // Step 4: Explicitly refetch to ensure UI has latest data
-            console.log('🔄 Refetching data...');
-            await Promise.all([
-                queryClient.refetchQueries({ queryKey: ['tenant', tenantId] }),
-                queryClient.refetchQueries({ queryKey: ['payments', tenantId] })
-            ]);
-
-            console.log('✅ Sync complete - UI refreshed with latest data');
+            console.log('✅ Sync complete - UI refresh triggered');
 
             toast.success('Ledger synchronized', {
                 description: `${result.recordsCreated} payments regenerated`
@@ -155,7 +146,7 @@ export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTen
         } finally {
             setIsSyncing(false);
         }
-    }, [tenantId, currentSettings, isSyncing, queryClient, waitForDatabaseSync]);
+    }, [tenantId, currentSettings, isSyncing, waitForDatabaseSync, onSyncComplete]);
 
     /**
      * Auto-sync when settings change
