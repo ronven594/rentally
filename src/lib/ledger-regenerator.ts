@@ -88,17 +88,24 @@ export async function regeneratePaymentLedger(
 
     try {
         // =====================================================================
-        // STEP 1: CALCULATE THE "CASH PAID" ANCHOR BEFORE ANY CHANGES
+        // STEP 1: COUNT THE UNPAID CYCLES (NOT CASH!) BEFORE ANY CHANGES
         // =====================================================================
-        // CRITICAL FIX (Historical Accrual Bug):
-        // When rent changes from $400 to $405, we CANNOT just use amount_paid from
-        // Paid records - if records are marked Unpaid, that data is lost!
+        // CRITICAL FIX (Cycle Creep Bug):
         //
-        // Instead, we derive cash paid from:
-        //   Cash_Paid = Total_Accrued_At_Old_Rate - Current_Outstanding_Balance
+        // When rent changes from $400 to $405, we must preserve the NUMBER OF
+        // UNPAID CYCLES, not the cash amount!
         //
-        // This ensures we preserve the tenant's actual payment history regardless
-        // of how records are marked.
+        // Problem with cash-based approach:
+        //   Cash paid = $2000, at $405/cycle = 4.94 cycles paid
+        //   floor(4.94) = 4 cycles paid, so 3 cycles unpaid ← WRONG!
+        //
+        // Solution - COUNT, DON'T CALCULATE:
+        //   Old balance = $800, old rent = $400
+        //   Unpaid cycles = floor($800 / $400) = 2 cycles ← THIS IS THE ANCHOR
+        //   New balance = 2 × $405 = $810 ← CORRECT!
+        //
+        // The landlord said tenant owes 2 cycles. After rent change, tenant
+        // still owes exactly 2 cycles. No ghost accruals!
         // =====================================================================
 
         // First, fetch ALL records to understand current state
@@ -137,47 +144,49 @@ export async function regeneratePaymentLedger(
         );
         const currentOutstandingBalance = Math.round((totalOwedFromRecords - totalPaidFromRecords) * 100) / 100;
 
-        // Create OLD date math settings for calculating cycles at old rate
-        const oldDateMathSettings: DateMathSettings = {
-            trackingStartDate: newSettings.trackingStartDate,
-            frequency: newSettings.frequency,
-            rentDueDay: newSettings.rentDueDay,
-            rentAmount: oldRentAmount
-        };
-
-        // Calculate total cycles from tracking start to today
-        const totalCycles = countCyclesToDate(currentDate, dateMathSettings);
-
-        // Calculate what SHOULD have been accrued at the OLD rate
-        const totalAccruedAtOldRate = Math.round(totalCycles * oldRentAmount * 100) / 100;
-
         // =====================================================================
-        // THE CASH PAID ANCHOR
+        // THE UNPAID CYCLE COUNT ANCHOR (Cycle Creep Fix)
         // =====================================================================
         // This is the CRITICAL calculation:
-        // Cash_Paid = What_Was_Accrued - What_Is_Still_Owed
         //
-        // Example: 7 cycles at $400 = $2800 accrued, $800 balance
-        //          Cash Paid = $2800 - $800 = $2000
+        // Unpaid_Cycle_Count = floor(Current_Balance / Old_Rent)
         //
-        // This $2000 is the ANCHOR - it's the actual money the tenant handed over
-        // and it MUST be preserved when rent changes!
+        // Example: Balance = $800, Old Rent = $400
+        //          Unpaid Cycles = floor($800 / $400) = 2 cycles
+        //
+        // This COUNT is the ANCHOR - it represents how many periods the tenant
+        // owes, and it MUST be preserved when rent changes!
+        //
+        // ROUNDING GUARD: We use Math.floor to prevent a $0.01 difference
+        // from triggering a whole new cycle of debt.
         // =====================================================================
-        const cashPaidByTenant = Math.round((totalAccruedAtOldRate - currentOutstandingBalance) * 100) / 100;
+        const unpaidCycleCount = oldRentAmount > 0
+            ? Math.floor(currentOutstandingBalance / oldRentAmount)
+            : 0;
+
+        // Calculate partial payment remainder (if any)
+        const partialPaymentRemainder = oldRentAmount > 0
+            ? Math.round((currentOutstandingBalance % oldRentAmount) * 100) / 100
+            : 0;
+
+        // Calculate total cycles from tracking start to today (for reference only)
+        const totalCyclesOnCalendar = countCyclesToDate(currentDate, dateMathSettings);
 
         console.log('═══════════════════════════════════════════════════════════════');
-        console.log('💰 CASH PAID ANCHOR CALCULATION (Historical Accrual Fix)');
+        console.log('🔢 UNPAID CYCLE COUNT ANCHOR (Cycle Creep Fix)');
         console.log('═══════════════════════════════════════════════════════════════');
         console.log('📊 Old State (Before Rent Change):');
         console.log(`   - Old Rent Amount: $${oldRentAmount.toFixed(2)}`);
-        console.log(`   - Total Cycles: ${totalCycles}`);
-        console.log(`   - Total Accrued (at old rate): $${totalAccruedAtOldRate.toFixed(2)}`);
         console.log(`   - Current Outstanding Balance: $${currentOutstandingBalance.toFixed(2)}`);
         console.log('');
-        console.log('💵 CASH PAID ANCHOR:');
-        console.log(`   - Cash Paid by Tenant: $${cashPaidByTenant.toFixed(2)}`);
-        console.log(`   - Formula: $${totalAccruedAtOldRate.toFixed(2)} - $${currentOutstandingBalance.toFixed(2)} = $${cashPaidByTenant.toFixed(2)}`);
-        console.log(`   - This represents actual money received from tenant`);
+        console.log('🔢 UNPAID CYCLE COUNT (THE ANCHOR):');
+        console.log(`   - Unpaid Cycles: ${unpaidCycleCount}`);
+        console.log(`   - Formula: floor($${currentOutstandingBalance.toFixed(2)} / $${oldRentAmount.toFixed(2)}) = ${unpaidCycleCount}`);
+        console.log(`   - Partial Payment Remainder: $${partialPaymentRemainder.toFixed(2)}`);
+        console.log('');
+        console.log('📅 Calendar Reference (NOT used for balance):');
+        console.log(`   - Total Cycles on Calendar: ${totalCyclesOnCalendar}`);
+        console.log(`   - Note: We do NOT add ghost cycles from the calendar!`);
         console.log('═══════════════════════════════════════════════════════════════');
 
         // Separate Paid records from Unpaid/Partial/Projected for deletion tracking
@@ -311,66 +320,67 @@ export async function regeneratePaymentLedger(
         }
 
         // =====================================================================
-        // STEP 4: Calculate NEW outstanding balance using CASH PAID ANCHOR
+        // STEP 4: Calculate NEW outstanding balance using UNPAID CYCLE COUNT
         // =====================================================================
-        // CRITICAL FORMULA (Historical Accrual Fix):
+        // CRITICAL FORMULA (Cycle Creep Fix):
         //
-        // We use the CASH PAID ANCHOR calculated in Step 1, NOT amount_paid from records!
+        // We preserve the NUMBER OF UNPAID CYCLES, not cash paid!
         //
-        // New_Total_Accrued = Number of cycles × NEW Rent Amount
-        // New_Outstanding_Balance = New_Total_Accrued - Cash_Paid_By_Tenant
+        // New_Outstanding_Balance = Unpaid_Cycle_Count × NEW_Rent_Amount
         //
-        // Example: 7 cycles, rent changes from $400 to $405
-        //   Old: 7 × $400 = $2800 accrued, $800 balance, so Cash Paid = $2000
-        //   New: 7 × $405 = $2835 accrued
-        //   New Balance = $2835 - $2000 = $835 (NOT $3000!)
+        // Example: Rent changes from $400 to $405, tenant was 2 cycles behind
+        //   Old: 2 cycles × $400 = $800 balance
+        //   New: 2 cycles × $405 = $810 balance ← EXACTLY 2 CYCLES!
         //
-        // This ensures we preserve the tenant's actual payment history!
+        // NO GHOST ACCRUALS: We do NOT look at the calendar and decide the
+        // tenant "should" owe more rent from months ago. If the landlord said
+        // they owed 2 cycles before, they owe 2 cycles after.
         // =====================================================================
 
-        const totalAccruedAtNewRate = Math.round(allDueDates.length * newSettings.rentAmount * 100) / 100;
-        const newOutstandingBalance = Math.round((totalAccruedAtNewRate - cashPaidByTenant) * 100) / 100;
+        // Calculate new balance: Unpaid cycles × New rent (+ partial remainder)
+        const newOutstandingBalance = Math.round(
+            (unpaidCycleCount * newSettings.rentAmount + partialPaymentRemainder) * 100
+        ) / 100;
+
+        // The number of unpaid cycles stays EXACTLY the same!
+        const cyclesUnpaid = unpaidCycleCount;
+
+        // Calculate paid cycles from calendar (for record generation only)
+        const cyclesPaidOnCalendar = Math.max(0, allDueDates.length - unpaidCycleCount);
 
         console.log('═══════════════════════════════════════════════════════════════');
-        console.log('🧮 NEW BALANCE CALCULATION (Using Cash Paid Anchor)');
+        console.log('🧮 NEW BALANCE CALCULATION (Using Unpaid Cycle Count)');
         console.log('═══════════════════════════════════════════════════════════════');
         console.log('📊 New State (After Rent Change):');
         console.log(`   - New Rent Amount: $${newSettings.rentAmount.toFixed(2)}`);
-        console.log(`   - Total Cycles: ${allDueDates.length}`);
-        console.log(`   - Total Accrued (at new rate): $${totalAccruedAtNewRate.toFixed(2)}`);
-        console.log(`   - Cash Paid by Tenant (preserved): $${cashPaidByTenant.toFixed(2)}`);
+        console.log(`   - Unpaid Cycle Count (PRESERVED): ${unpaidCycleCount}`);
+        console.log(`   - Partial Remainder: $${partialPaymentRemainder.toFixed(2)}`);
         console.log('');
         console.log('💰 NEW OUTSTANDING BALANCE:');
         console.log(`   - New Balance: $${newOutstandingBalance.toFixed(2)}`);
-        console.log(`   - Formula: $${totalAccruedAtNewRate.toFixed(2)} - $${cashPaidByTenant.toFixed(2)} = $${newOutstandingBalance.toFixed(2)}`);
-        console.log(`   - Cycles Behind: ${Math.ceil(newOutstandingBalance / newSettings.rentAmount)}`);
+        console.log(`   - Formula: ${unpaidCycleCount} cycles × $${newSettings.rentAmount.toFixed(2)} + $${partialPaymentRemainder.toFixed(2)} = $${newOutstandingBalance.toFixed(2)}`);
+        console.log(`   - Cycles Behind: ${unpaidCycleCount} (EXACTLY preserved!)`);
         if (oldRentAmount !== newSettings.rentAmount) {
-            const oldCyclesBehind = Math.ceil(currentOutstandingBalance / oldRentAmount);
-            const newCyclesBehind = Math.ceil(newOutstandingBalance / newSettings.rentAmount);
             console.log('');
             console.log('📈 RENT CHANGE IMPACT:');
-            console.log(`   - Old: ${oldCyclesBehind} cycles × $${oldRentAmount.toFixed(2)} = $${currentOutstandingBalance.toFixed(2)}`);
-            console.log(`   - New: ~${newCyclesBehind} cycles × $${newSettings.rentAmount.toFixed(2)} = $${newOutstandingBalance.toFixed(2)}`);
+            console.log(`   - Old: ${unpaidCycleCount} cycles × $${oldRentAmount.toFixed(2)} = $${currentOutstandingBalance.toFixed(2)}`);
+            console.log(`   - New: ${unpaidCycleCount} cycles × $${newSettings.rentAmount.toFixed(2)} = $${newOutstandingBalance.toFixed(2)}`);
             console.log(`   - Difference: $${(newOutstandingBalance - currentOutstandingBalance).toFixed(2)}`);
+            console.log(`   - Cycles Changed: NO! Still exactly ${unpaidCycleCount} cycles`);
         }
         console.log('═══════════════════════════════════════════════════════════════');
 
-        // Determine how many cycles are paid vs unpaid using cash paid
-        const cyclesPaidAtNewRate = Math.floor(cashPaidByTenant / newSettings.rentAmount);
-        const cyclesUnpaid = Math.max(0, allDueDates.length - cyclesPaidAtNewRate);
-
         console.log('📊 Cycle Distribution:', {
-            totalCycles: allDueDates.length,
-            cyclesPaid: cyclesPaidAtNewRate,
-            cyclesUnpaid,
-            partialPayment: cashPaidByTenant % newSettings.rentAmount > 0.01
-                ? `$${(cashPaidByTenant % newSettings.rentAmount).toFixed(2)}`
-                : 'None'
+            totalCyclesOnCalendar: allDueDates.length,
+            cyclesPaidOnCalendar,
+            cyclesUnpaid: unpaidCycleCount,
+            note: 'Unpaid count preserved from old balance, NOT calculated from calendar'
         });
 
-        // Create NEW Unpaid records ONLY for cycles that haven't been paid
-        // Start from the (cyclesPaidAtNewRate + 1)th cycle onwards
-        const unpaidDueDates = allDueDates.slice(cyclesPaidAtNewRate);
+        // Create NEW Unpaid records ONLY for the unpaid cycles
+        // We create EXACTLY unpaidCycleCount records (preserved from old balance)
+        // Take the MOST RECENT cycles (from the end of the calendar)
+        const unpaidDueDates = allDueDates.slice(-unpaidCycleCount);
 
         const allPaymentRecords = unpaidDueDates.map(dueDate => ({
             tenant_id: tenantId,
@@ -487,7 +497,7 @@ export async function regeneratePaymentLedger(
                 recordsDeleted: unpaidRecords.length,
                 recordsCreated: insertedPayments.length,
                 paidRecordsPreserved: survivingPaidRecords?.length || 0,
-                cashPaidByTenant: cashPaidByTenant,
+                unpaidCycleCount: unpaidCycleCount,
                 newBalance: newOutstandingBalance,
                 newOverdueSince: resolvedStatus.dateSince,
                 paidUntilDate: resolvedStatus.paidUntilDate,
@@ -536,7 +546,7 @@ export async function regeneratePaymentLedger(
                 recordsDeleted: unpaidRecords.length,
                 recordsCreated: insertedPayments.length,
                 paidRecordsPreserved: survivingPaidRecords?.length || 0,
-                cashPaidByTenant: cashPaidByTenant,
+                unpaidCycleCount: unpaidCycleCount,
                 newBalance: newOutstandingBalance,
                 creditAmount: newOutstandingBalance < 0 ? Math.abs(newOutstandingBalance) : 0,
                 paidUntilDate: lastDueDate
@@ -557,7 +567,7 @@ export async function regeneratePaymentLedger(
                 recordsDeleted: unpaidRecords.length,
                 recordsCreated: 0,
                 paidRecordsPreserved: survivingPaidRecords?.length || 0,
-                cashPaidByTenant: cashPaidByTenant,
+                unpaidCycleCount: unpaidCycleCount,
                 balanceRedistributed: 0
             });
 
