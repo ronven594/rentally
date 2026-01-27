@@ -19,6 +19,8 @@ import { usePathname } from "next/navigation"
 import { useAuth } from "@/contexts/AuthContext"
 import { calculateRentalLogic, type RentalLogicResult } from "@/hooks/useRentalLogic"
 import type { StrikeRecord, NoticeType } from "@/lib/legal-engine"
+import { calculateTenantStatus, type TenantStatusResult } from "@/lib/status-calculator"
+import { toRentSettings, toPayments } from "@/lib/rent-calculator"
 
 // Initial Properties with Tenants
 const INITIAL_PROPERTIES: Property[] = [];
@@ -633,6 +635,47 @@ export default function RentTrackerPage() {
 
         return statuses;
     }, [properties, payments, strikeHistories, testDate]);
+
+    // Calculate unified tenant status from status-calculator (Session 4+)
+    // This is the SINGLE SOURCE OF TRUTH for severity, strikes, notices, and display text.
+    const tenantStatuses = useMemo(() => {
+        const statuses: Record<string, TenantStatusResult> = {};
+
+        properties.forEach(property => {
+            property.tenants.forEach(tenant => {
+                if (!tenant.frequency || !tenant.rentAmount || !tenant.rentDueDay) return;
+
+                const settings = toRentSettings({
+                    frequency: tenant.frequency,
+                    rentAmount: tenant.rentAmount,
+                    rentDueDay: tenant.rentDueDay,
+                    trackingStartDate: tenant.trackingStartDate || tenant.startDate,
+                    openingArrears: tenant.openingArrears
+                });
+
+                const tenantPayments = payments.filter(p => p.tenantId === tenant.id);
+                const convertedPayments = toPayments(tenantPayments.map(p => ({
+                    id: p.id,
+                    amount_paid: p.amount_paid,
+                    paidDate: p.paidDate
+                })));
+
+                const sentNotices = tenant.sentNotices || [];
+                const region = (property.region || 'Auckland') as any;
+
+                statuses[tenant.id] = calculateTenantStatus(
+                    settings,
+                    convertedPayments,
+                    sentNotices,
+                    tenant.remedyNoticeSentAt,
+                    region,
+                    testDate
+                );
+            });
+        });
+
+        return statuses;
+    }, [properties, payments, testDate]);
 
     // Record Payment (Oldest Dollar First) - AI-first reconciliation model
     const handleRecordPayment = async (tenantId: string, paymentAmount: number, paymentDate: string) => {
@@ -1359,48 +1402,28 @@ export default function RentTrackerPage() {
         }
     };
 
-    // Build portfolio status from legal statuses
+    // Build portfolio status from unified tenant statuses
     const { obligations, globalSeverityRank } = useMemo(() => {
         const tenantObligations: Array<{ name: string; propertyAddress: string; daysLate: number; calendarDays?: number; activeStrikeCount: number }> = [];
-        let maxRank = 1; // Start with lowest severity
+        let maxRank = 1;
 
         properties.forEach(property => {
             property.tenants.forEach(tenant => {
-                const legalStatus = tenantLegalStatuses[tenant.id];
-                if (!legalStatus) return;
+                const status = tenantStatuses[tenant.id];
+                if (!status) return;
 
-                // Calculate severity rank for this tenant (same logic as PropertyCard)
-                const { daysOverdue, workingDaysOverdue, totalBalanceDue, activeStrikeCount = 0 } = legalStatus;
-
-                // Skip if paid
-                if (totalBalanceDue > 0) {
-                    // RANK 5: RED_BREATHING (Termination - 21+ days OR 3 strikes)
-                    if (daysOverdue >= 21 || activeStrikeCount >= 3) {
-                        maxRank = Math.max(maxRank, 5);
-                    }
-                    // RANK 4: RED_SOLID (10-20 days overdue)
-                    else if (workingDaysOverdue >= 10) {
-                        maxRank = Math.max(maxRank, 4);
-                    }
-                    // RANK 3: GOLD_SOLID (5-9 days overdue)
-                    else if (workingDaysOverdue >= 5) {
-                        maxRank = Math.max(maxRank, 3);
-                    }
-                    // RANK 2: AMBER_OUTLINE (1-4 days overdue)
-                    else if (workingDaysOverdue >= 1) {
-                        maxRank = Math.max(maxRank, 2);
-                    }
-                }
+                // Use severity tier directly from status-calculator
+                const tierToRank: Record<number, number> = { 0: 1, 1: 2, 2: 3, 3: 4, 4: 4, 5: 5 };
+                maxRank = Math.max(maxRank, tierToRank[status.severity.tier] ?? 1);
 
                 // Collect obligations for the banner
-                // Include ALL overdue states: Payment Pending (0 strikes), Strike 1, Strike 2+
-                if (legalStatus.daysOverdue >= 1) {
+                if (status.rentState.daysOverdue >= 1) {
                     tenantObligations.push({
                         name: tenant.name,
                         propertyAddress: property.address,
-                        daysLate: legalStatus.workingDaysOverdue,  // Use working days for legal compliance
-                        calendarDays: legalStatus.daysOverdue,     // Calendar days for Monitor phase display
-                        activeStrikeCount: legalStatus.activeStrikeCount || 0, // CRITICAL: Strike count for severity
+                        daysLate: status.workingDaysOverdue,
+                        calendarDays: status.rentState.daysOverdue,
+                        activeStrikeCount: status.strikes.activeStrikes,
                     });
                 }
             });
@@ -1410,7 +1433,7 @@ export default function RentTrackerPage() {
             obligations: getObligationMessages(tenantObligations),
             globalSeverityRank: maxRank as 1 | 2 | 3 | 4 | 5,
         };
-    }, [properties, tenantLegalStatuses]);
+    }, [properties, tenantStatuses]);
 
     const managingTenant = properties.flatMap(p => p.tenants).find(t => t.id === managingTenantId);
     const managingTenantPropertyId = properties.find(p => p.tenants.some(t => t.id === managingTenantId))?.id || "";
@@ -1542,7 +1565,7 @@ export default function RentTrackerPage() {
                                 key={property.id}
                                 property={property}
                                 payments={payments}
-                                tenantLegalStatuses={tenantLegalStatuses}
+                                tenantStatuses={tenantStatuses}
                                 testDate={testDate || undefined}
                                 onRecordPayment={handleRecordPayment}
                                 onVoidPayment={handleVoidPayment}

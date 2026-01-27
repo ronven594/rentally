@@ -16,7 +16,8 @@ import { User, Mail, Phone, Calendar, Loader2, UserPlus } from "lucide-react"
 import { supabase } from "@/lib/supabaseClient"
 import { toast } from "sonner"
 import { format, addDays, addWeeks, addMonths, parseISO } from "date-fns"
-import { resolveTenantStatus, applyResolvedStatus } from "@/lib/tenant-status-resolver"
+// SESSION 4: tenant-status-resolver is deprecated. Ledger records are display-only.
+// Status is derived at render time from calculateRentState() via deriveLedgerRecordStatus().
 
 interface AddTenantDialogProps {
     open: boolean;
@@ -234,14 +235,16 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                     });
 
                     // =====================================================================
-                    // STEP 1: Create ALL payment records as Unpaid initially
+                    // STEP 1: Create ALL payment records as Pending (display-only)
+                    // SESSION 4: Records are display-only. Status is derived at render
+                    // time from calculateRentState() via deriveLedgerRecordStatus().
                     // =====================================================================
                     const allPaymentRecords = allDueDates.map(dueDate => ({
                         tenant_id: data.id,
                         property_id: propertyId,
                         due_date: format(dueDate, 'yyyy-MM-dd'),
                         amount: rentAmount,
-                        status: 'Unpaid' as const,
+                        status: 'Pending' as const,
                         amount_paid: 0,
                         paid_date: null
                     }));
@@ -264,45 +267,12 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
 
                     console.log('✅ Payment records created successfully');
 
-                    // =====================================================================
-                    // STEP 2: Use AI Status Resolver to determine which are actually unpaid
-                    // =====================================================================
-                    if (finalOpeningBalance > 0 && insertedPayments && insertedPayments.length > 0) {
-                        console.log('🤖 Running AI Status Resolver...');
-
-                        const resolvedStatus = resolveTenantStatus(
-                            insertedPayments.map(p => ({
-                                id: p.id,
-                                due_date: p.due_date,
-                                amount: p.amount,
-                                status: p.status,
-                                amount_paid: p.amount_paid
-                            })),
-                            {
-                                trackingStartDate: finalTrackingStartDate,
-                                openingBalance: finalOpeningBalance,
-                                rentAmount,
-                                frequency
-                            },
-                            today
-                        );
-
-                        console.log('🎯 Resolver result:', resolvedStatus);
-
-                        // =====================================================================
-                        // STEP 3: Apply the resolved status to the database
-                        // =====================================================================
-                        try {
-                            await applyResolvedStatus(resolvedStatus, supabase);
-                            console.log('✅ AI Status Resolver applied successfully');
-                            toast.success(`${firstName} added with ${resolvedStatus.balance.toFixed(2)} outstanding balance`);
-                        } catch (applyError) {
-                            console.error('❌ Failed to apply resolved status:', applyError);
-                            toast.error('Tenant created but status resolution failed.');
-                        }
+                    // SESSION 4: No resolver needed. Ledger records are display-only.
+                    // Balance and status are derived at render time from calculateRentState().
+                    if (finalOpeningBalance > 0) {
+                        toast.success(`${firstName} added with $${finalOpeningBalance.toFixed(2)} opening arrears`);
                     } else {
-                        // No opening balance - tenant is paid up
-                        console.log('✅ No opening balance - all payments left as unpaid for watchdog to manage');
+                        console.log('✅ No opening balance - tenant starts clean');
                     }
                 }
 

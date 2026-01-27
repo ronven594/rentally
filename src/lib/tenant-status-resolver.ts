@@ -1,22 +1,20 @@
 /**
  * AI Status Resolver
  *
- * Takes raw payment records and tenant settings, then intelligently resolves:
- * - Which payments are actually unpaid based on "Amount Behind"
- * - The true overdue date (using Ground Zero anchor)
- * - Current balance and days overdue
+ * @deprecated SESSION 4: This module is DEPRECATED.
  *
- * CRITICAL LOGIC:
- * If a user says tenant is "$600 behind", we assume:
- * - The OLDEST periods are Paid (tenant was paying earlier)
- * - Only the MOST RECENT $600 worth of cycles are Unpaid
+ * Balance and status are now calculated by:
+ * - calculateRentState() in rent-calculator.ts (balance)
+ * - calculateTenantStatus() in status-calculator.ts (severity, strikes, notices)
+ * - deriveLedgerRecordStatus() in ledger-regenerator.ts (ledger display status)
  *
- * This matches real-world scenarios where tenants fall behind gradually,
- * not that they never paid from the start.
+ * This file is kept for backward compatibility but should NOT be used
+ * for new code. Its functions (resolveTenantStatus, applyResolvedStatus)
+ * are no longer called by the ledger regenerator or AddTenantDialog.
  *
- * USES SHARED DATE MATH:
- * All date calculations use payment-date-math.ts to ensure consistency
- * with ledger-regenerator.ts.
+ * ORIGINAL PURPOSE:
+ * Takes raw payment records and tenant settings, then intelligently resolves
+ * which payments are actually unpaid based on "Amount Behind".
  */
 
 import { parseISO, format } from "date-fns";

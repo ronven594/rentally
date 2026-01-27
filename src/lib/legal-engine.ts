@@ -480,10 +480,18 @@ export function calculateWorkingDaysOverdue(
 /**
  * Calculates total arrears amount from ledger.
  *
+ * @deprecated SESSION 4: Balance should come from calculateRentState() in rent-calculator.ts.
+ * This function derives balance from ledger record statuses, which is the OLD approach.
+ * It's kept for backward compatibility with analyzeTenancySituation() but should NOT
+ * be used as the primary balance source. Use calculateRentState().currentBalance instead.
+ *
  * @param ledger - Array of ledger entries
- * @returns Total unpaid amount
+ * @returns Total unpaid amount (legacy calculation)
  */
 export function calculateTotalArrears(ledger: LedgerEntry[]): number {
+    // SESSION 4 NOTE: Ledger records now have status='Pending' (display-only).
+    // This function will return 0 for regenerated ledgers since no records
+    // are marked 'Unpaid'. This is intentional - balance comes from calculateRentState().
     return ledger
         .filter(entry => entry.status === "Unpaid" || entry.status === "Partial")
         .reduce((total, entry) => {

@@ -1,20 +1,18 @@
 /**
  * Tenant Ledger Sync Hook
  *
- * Automatically regenerates the payment ledger when tenant settings change.
- * This is the "reactive AI resolver" that keeps the ledger in sync with settings.
+ * SESSION 4 REFACTOR: Simplified to use display-only ledger regeneration.
  *
- * RACE CONDITION FIX:
- * - Provides loading state via isSyncing
- * - Waits for regeneration to complete via database wait
- * - Only triggers onSyncComplete after confirmation
+ * WHAT CHANGED:
+ * - Sync now only regenerates display schedule (no balance implications)
+ * - Balance comes from calculateRentState(), not ledger records
+ * - Settings changes use handleSettingsChange() for balance continuity
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { regeneratePaymentLedger, shouldRegenerateLedger, TenantSettings } from "@/lib/ledger-regenerator";
+import { regeneratePaymentLedger, shouldRegenerateLedger, type TenantSettings } from "@/lib/ledger-regenerator";
 import { supabase } from "@/lib/supabaseClient";
 import { toast } from "sonner";
-import type { RealtimeChannel } from "@supabase/supabase-js";
 
 export interface UseTenantLedgerSyncOptions {
     tenantId: string;
@@ -23,8 +21,8 @@ export interface UseTenantLedgerSyncOptions {
     frequency: 'Weekly' | 'Fortnightly' | 'Monthly';
     rentDueDay: string;
     propertyId: string;
-    enabled?: boolean; // Allow disabling the sync (e.g., during form initialization)
-    onSyncComplete?: () => void; // Callback when sync is complete - use this to refresh data
+    enabled?: boolean;
+    onSyncComplete?: () => void;
 }
 
 export interface UseTenantLedgerSyncReturn {
@@ -33,25 +31,10 @@ export interface UseTenantLedgerSyncReturn {
 }
 
 /**
- * Hook to automatically regenerate payment ledger when tenant settings change
+ * Hook to regenerate display-only payment ledger.
  *
- * Usage in EditTenantDialog or ManageTenantDialog:
- * ```tsx
- * const { isSyncing, syncLedger } = useTenantLedgerSync({
- *   tenantId: tenant.id,
- *   trackingStartDate: tenant.trackingStartDate,
- *   rentAmount: formRentAmount,
- *   frequency: formFrequency,
- *   rentDueDay: formRentDueDay,
- *   propertyId: tenant.propertyId,
- *   enabled: !isInitializing
- * });
- *
- * // In your UI:
- * <Button onClick={syncLedger} disabled={isSyncing}>
- *   {isSyncing ? 'Syncing...' : 'Sync Ledger'}
- * </Button>
- * ```
+ * IMPORTANT: This only regenerates the visual schedule.
+ * Balance is calculated by calculateRentState() independently.
  */
 export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTenantLedgerSyncReturn {
     const {
@@ -66,7 +49,6 @@ export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTen
     } = options;
 
     const [isSyncing, setIsSyncing] = useState(false);
-    const channelRef = useRef<RealtimeChannel | null>(null);
     const previousSettingsRef = useRef<TenantSettings | null>(null);
 
     const currentSettings: TenantSettings = {
@@ -79,21 +61,7 @@ export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTen
     };
 
     /**
-     * Wait for database writes to complete
-     * Gives a small buffer to ensure all Supabase operations have finished
-     */
-    const waitForDatabaseSync = useCallback((): Promise<void> => {
-        return new Promise((resolve) => {
-            // Wait 300ms to ensure all database writes have propagated
-            setTimeout(() => {
-                console.log('✅ Database sync wait complete');
-                resolve();
-            }, 300);
-        });
-    }, []);
-
-    /**
-     * Manual sync trigger - returns a Promise that resolves when complete
+     * Manual sync trigger - regenerates display ledger only
      */
     const syncLedger = useCallback(async () => {
         if (isSyncing) {
@@ -101,42 +69,28 @@ export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTen
             return;
         }
 
-        console.log('🔄 Manual sync triggered:', {
-            tenantId,
-            currentSettings
-        });
+        console.log('🔄 Sync triggered (display-only regeneration):', { tenantId });
 
         setIsSyncing(true);
 
         try {
-            // Step 1: Trigger regeneration (this completes all database operations)
-            console.log('📝 Starting ledger regeneration...');
             const result = await regeneratePaymentLedger(tenantId, currentSettings, supabase);
 
             if (!result.success) {
                 throw new Error(result.error || 'Regeneration failed');
             }
 
-            console.log('✅ Regeneration completed successfully:', {
+            console.log('✅ Sync complete:', {
                 recordsDeleted: result.recordsDeleted,
-                recordsCreated: result.recordsCreated,
-                balanceRedistributed: result.balanceRedistributed
+                recordsCreated: result.recordsCreated
             });
 
-            // Step 2: Wait for database writes to propagate
-            console.log('⏳ Waiting for database sync...');
-            await waitForDatabaseSync();
-
-            // Step 3: Trigger callback to refresh UI
-            console.log('🔄 Triggering UI refresh callback...');
             if (onSyncComplete) {
                 onSyncComplete();
             }
 
-            console.log('✅ Sync complete - UI refresh triggered');
-
             toast.success('Ledger synchronized', {
-                description: `${result.recordsCreated} payments regenerated`
+                description: `${result.recordsCreated} schedule entries generated`
             });
         } catch (error: any) {
             console.error('❌ Sync failed:', error);
@@ -146,48 +100,26 @@ export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTen
         } finally {
             setIsSyncing(false);
         }
-    }, [tenantId, currentSettings, isSyncing, waitForDatabaseSync, onSyncComplete]);
+    }, [tenantId, currentSettings, isSyncing, onSyncComplete]);
 
     /**
      * Auto-sync when settings change
      */
     useEffect(() => {
-        // Skip if disabled or no previous settings (first render)
         if (!enabled || !previousSettingsRef.current) {
             previousSettingsRef.current = currentSettings;
             return;
         }
 
-        // Skip if already syncing
-        if (isSyncing) {
-            return;
-        }
+        if (isSyncing) return;
 
-        // Check if settings changed in a way that requires regeneration
         if (shouldRegenerateLedger(previousSettingsRef.current, currentSettings)) {
-            console.log('🔄 Settings changed - auto-syncing ledger:', {
-                oldSettings: previousSettingsRef.current,
-                newSettings: currentSettings
-            });
-
-            // Trigger sync automatically
+            console.log('🔄 Settings changed - auto-syncing display ledger');
             syncLedger();
         }
 
-        // Update previous settings
         previousSettingsRef.current = currentSettings;
     }, [enabled, tenantId, trackingStartDate, rentAmount, frequency, rentDueDay, propertyId, isSyncing, syncLedger]);
-
-    /**
-     * Cleanup realtime subscriptions on unmount
-     */
-    useEffect(() => {
-        return () => {
-            if (channelRef.current) {
-                channelRef.current.unsubscribe();
-            }
-        };
-    }, []);
 
     return {
         isSyncing,
@@ -197,16 +129,11 @@ export function useTenantLedgerSync(options: UseTenantLedgerSyncOptions): UseTen
 
 /**
  * Standalone manual trigger for ledger regeneration
- *
- * Use this when you want to explicitly trigger regeneration outside of a component
- * For component usage, prefer the useTenantLedgerSync hook
  */
 export async function manuallyRegenerateLedger(
     tenantId: string,
     settings: Omit<TenantSettings, 'id'>
 ): Promise<boolean> {
-    console.log('🔄 Manual ledger regeneration triggered');
-
     const fullSettings: TenantSettings = {
         id: tenantId,
         ...settings
@@ -215,8 +142,8 @@ export async function manuallyRegenerateLedger(
     const result = await regeneratePaymentLedger(tenantId, fullSettings, supabase);
 
     if (result.success) {
-        toast.success('Payment ledger regenerated', {
-            description: `${result.recordsCreated} payments created, balance redistributed: $${result.balanceRedistributed.toFixed(2)}`
+        toast.success('Payment schedule regenerated', {
+            description: `${result.recordsCreated} entries created`
         });
         return true;
     } else {
