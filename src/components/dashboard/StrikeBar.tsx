@@ -1,6 +1,7 @@
 import { cn } from "@/lib/utils"
 
 interface StrikeBarProps {
+    /** Number of active strikes in the 90-day window */
     strikes: number;
     maxStrikes?: number;
     className?: string;
@@ -11,64 +12,52 @@ interface StrikeBarProps {
      */
     windowExpiryDate?: string;
     /**
-     * Number of working days the tenant is overdue
-     * Used to determine which pills show eligibility shimmer
+     * Whether a new strike can be issued right now.
+     * True when there's a due date that is 5+ working days overdue
+     * and hasn't already been struck.
+     */
+    canIssueNextStrike?: boolean;
+    /**
+     * @deprecated Legacy prop - ignored in per-due-date model
      */
     workingDaysOverdue?: number;
     /**
-     * @deprecated Use workingDaysOverdue instead for per-pill eligibility
-     * Whether the next strike is eligible to be issued
-     * Shows shimmer effect on the next empty pill when true
+     * @deprecated Legacy prop - use canIssueNextStrike instead
      */
     isStrikeEligible?: boolean;
+    /**
+     * Effective date for window reset calculation (supports test date override)
+     */
+    effectiveDate?: Date;
 }
 
-export function StrikeBar({ strikes, maxStrikes = 3, className, glow = false, windowExpiryDate, workingDaysOverdue = 0, isStrikeEligible = false }: StrikeBarProps) {
+export function StrikeBar({ strikes, maxStrikes = 3, className, glow = false, windowExpiryDate, canIssueNextStrike = false, effectiveDate }: StrikeBarProps) {
     // Calculate days until window reset
     let daysUntilReset: number | null = null;
     if (windowExpiryDate && strikes > 0 && strikes < maxStrikes) {
         const expiryDate = new Date(windowExpiryDate);
-        const today = new Date();
+        const today = effectiveDate || new Date();
         const diffTime = expiryDate.getTime() - today.getTime();
         daysUntilReset = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
     }
 
     /**
-     * Determine pill state based on strict sequential RTA-compliant logic
-     * @param pillIndex - 0-based index (0 = Strike 1, 1 = Strike 2, 2 = Strike 3)
+     * Determine pill state using per-due-date RTA logic.
      *
-     * CRITICAL SEQUENTIAL RULES:
-     * - Pills only shimmer (ELIGIBLE) if the PREVIOUS strike has been sent
-     * - Pill must meet working days threshold for that specific strike tier
-     * - Only ONE pill can be ELIGIBLE at a time (the next sequential strike)
+     * In the per-due-date model, eligibility is simple:
+     * - Pills 0..strikes-1 are SENT
+     * - The next pill (index === strikes) is ELIGIBLE if canIssueNextStrike
+     * - All others are INACTIVE
      */
     const getPillState = (pillIndex: number): 'SENT' | 'ELIGIBLE' | 'INACTIVE' => {
-        // STATE A: SENT (Static Slate Blue #64748B)
-        // This strike has already been issued and is within the 90-day window
         if (pillIndex < strikes) {
             return 'SENT';
         }
 
-        // STATE B: ELIGIBLE (Gold Shimmer)
-        // STRICT SEQUENTIAL LOGIC: Only the NEXT strike can be eligible
-        // Pill 0 (Strike 1): Eligible if NO strikes sent yet AND 5+ working days overdue
-        // Pill 1 (Strike 2): Eligible if EXACTLY 1 strike sent AND 10+ working days overdue
-        // Pill 2 (Strike 3): Eligible if EXACTLY 2 strikes sent AND 15+ working days overdue
-
-        const eligibilityThresholds = [5, 10, 15];
-        const threshold = eligibilityThresholds[pillIndex];
-
-        // Only the NEXT sequential strike (pillIndex === strikes) can be ELIGIBLE
-        // AND tenant must meet the working days threshold for this strike tier
-        if (pillIndex === strikes && workingDaysOverdue >= threshold) {
+        if (pillIndex === strikes && canIssueNextStrike) {
             return 'ELIGIBLE';
         }
 
-        // STATE C: INACTIVE (Light Gray/Empty)
-        // Default for all other cases:
-        // - Future strikes beyond the next one
-        // - Strikes that haven't met the working days threshold yet
-        // - When tenant is paid up (workingDaysOverdue < threshold)
         return 'INACTIVE';
     };
 

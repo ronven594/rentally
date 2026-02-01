@@ -755,25 +755,15 @@ export function canIssueStrikeNotice(
     existingStrikes: StrikeRecord[],
     region?: NZRegion,
     currentDate: Date = new Date()
-): { canIssue: boolean; reason: string } {
+): { canIssue: boolean; reason: string; dueDateFor?: string } {
     const unpaidEntries = ledger.filter(e => e.status === "Unpaid" || e.status === "Partial");
 
     if (unpaidEntries.length === 0) {
         return { canIssue: false, reason: "No unpaid rent entries." };
     }
 
-    const oldestUnpaid = unpaidEntries.sort((a, b) => a.dueDate.localeCompare(b.dueDate))[0];
-    const workingDaysOverdue = calculateWorkingDaysOverdue(oldestUnpaid.dueDate, currentDate, region);
-
-    if (workingDaysOverdue < 5) {
-        return {
-            canIssue: false,
-            reason: `Only ${workingDaysOverdue} working days overdue. Must be at least 5 working days.`
-        };
-    }
-
+    // Check 90-day window first
     const validStrikes = getValidStrikesInWindow(existingStrikes.filter(s => s.type === "S55_STRIKE"), currentDate);
-
     if (validStrikes.length >= 3) {
         return {
             canIssue: false,
@@ -781,5 +771,42 @@ export function canIssueStrikeNotice(
         };
     }
 
-    return { canIssue: true, reason: "Strike notice can be issued." };
+    // Find a due date that is 5+ working days overdue AND not already struck
+    // Sort oldest first so we strike the earliest eligible date
+    const sortedUnpaid = [...unpaidEntries].sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+
+    for (const entry of sortedUnpaid) {
+        const workingDaysOverdue = calculateWorkingDaysOverdue(entry.dueDate, currentDate, region);
+        if (workingDaysOverdue < 5) continue;
+
+        // Check if a strike was already issued for this due date
+        const alreadyStruck = existingStrikes.some(
+            s => s.type === "S55_STRIKE" && s.rentDueDate === entry.dueDate
+        );
+        if (alreadyStruck) continue;
+
+        return {
+            canIssue: true,
+            reason: `Strike notice can be issued for rent due ${entry.dueDate} (${workingDaysOverdue} working days overdue).`,
+            dueDateFor: entry.dueDate,
+        };
+    }
+
+    // All eligible due dates already have strikes
+    const anyEligible = sortedUnpaid.some(
+        e => calculateWorkingDaysOverdue(e.dueDate, currentDate, region) >= 5
+    );
+    if (anyEligible) {
+        return {
+            canIssue: false,
+            reason: "All overdue due dates already have strike notices issued."
+        };
+    }
+
+    const oldestUnpaid = sortedUnpaid[0];
+    const workingDaysOverdue = calculateWorkingDaysOverdue(oldestUnpaid.dueDate, currentDate, region);
+    return {
+        canIssue: false,
+        reason: `Only ${workingDaysOverdue} working days overdue. Must be at least 5 working days.`
+    };
 }

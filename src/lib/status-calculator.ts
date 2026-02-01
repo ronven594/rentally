@@ -39,6 +39,12 @@ import {
     TRIBUNAL_FILING_WINDOW_DAYS
 } from "./rta-constants";
 
+import {
+    calculateStrikeEligibilityPerDueDate,
+    type StrikeEligibilityResult,
+    type DueDateStrikeStatus,
+} from "./strike-eligibility";
+
 // ============================================================================
 // TYPES
 // ============================================================================
@@ -69,18 +75,28 @@ export interface SeverityInfo {
 }
 
 export interface StrikeEligibility {
-    /** Whether strike 1 can be issued (5+ working days, <1 active strikes) */
+    /** Whether strike 1 can be issued */
     canIssueStrike1: boolean;
-    /** Whether strike 2 can be issued (10+ working days, <2 active strikes) */
+    /** Whether strike 2 can be issued */
     canIssueStrike2: boolean;
-    /** Whether strike 3 can be issued (15+ working days, <3 active strikes) */
+    /** Whether strike 3 can be issued */
     canIssueStrike3: boolean;
     /** Strikes within 90-day rolling window */
     activeStrikes: number;
     /** Next strike number to issue (1, 2, 3), or null if all issued or not eligible */
     nextStrikeNumber: number | null;
-    /** The next strike's working day threshold */
+    /** The next strike's working day threshold (always 5 in per-due-date model) */
     nextStrikeThreshold: number | null;
+    /** Whether a new strike can be issued (any eligible due date exists) */
+    canIssueStrike: boolean;
+    /** The specific due date the next strike would be for */
+    nextStrikeableDueDate: Date | null;
+    /** Working days overdue for the next strikeable due date */
+    nextStrikeableWorkingDays: number | null;
+    /** When the 90-day window expires */
+    windowExpiryDate: string | null;
+    /** Per-due-date status breakdown (for UI) */
+    dueDateStatuses: DueDateStrikeStatus[];
 }
 
 export interface NoticeEligibility {
@@ -91,9 +107,11 @@ export interface NoticeEligibility {
     /** Whether landlord can apply to Tenancy Tribunal for termination */
     canApplyForTermination: boolean;
     /** Which RTA section applies */
-    terminationBasis: '21_day_rule' | 'three_strikes' | null;
+    terminationBasis: '21_day_rule' | 'three_strikes' | 'section_56_expired' | null;
     /** Days remaining to file at tribunal (after 3rd strike, 28-day window) */
     tribunalDeadlineDays: number | null;
+    /** Section 56: 14-day remedy notice expired and tenant hasn't remedied */
+    section56Expired: boolean;
 }
 
 export interface TenantStatusResult {
@@ -155,8 +173,14 @@ export function calculateTenantStatus(
         ? countWorkingDaysBetween(rentState.oldestUnpaidDueDate, effectiveDate, region)
         : 0;
 
-    // Step 3: Count active strikes (90-day window)
-    const activeStrikes = countActiveStrikes(sentNotices, effectiveDate);
+    // Step 3: Calculate per-due-date strike eligibility (replaces old 5/10/15 model)
+    const strikeResult = calculateStrikeEligibilityPerDueDate(
+        settings,
+        sentNotices,
+        effectiveDate,
+        region
+    );
+    const activeStrikes = strikeResult.activeStrikes;
 
     // Step 4: Determine severity tier
     const severity = determineSeverity(
@@ -165,11 +189,15 @@ export function calculateTenantStatus(
         workingDaysOverdue,
         activeStrikes,
         sentNotices,
-        remedyNoticeSentAt
+        remedyNoticeSentAt,
+        strikeResult.canIssueStrike,
+        strikeResult.nextStrikeNumber
     );
 
-    // Step 5: Calculate strike eligibility
-    const strikes = calculateStrikeEligibility(workingDaysOverdue, activeStrikes);
+    // Step 5: Map strike eligibility result to StrikeEligibility interface
+    const strikes: StrikeEligibility = {
+        ...strikeResult,
+    };
 
     // Step 6: Calculate notice eligibility
     const notices = calculateNoticeEligibility(
@@ -217,7 +245,9 @@ function determineSeverity(
     workingDaysOverdue: number,
     activeStrikes: number,
     sentNotices: StrikeNotice[],
-    remedyNoticeSentAt?: string | null
+    remedyNoticeSentAt?: string | null,
+    canIssueStrike?: boolean,
+    nextStrikeNumber?: number | null
 ): SeverityInfo {
     // TIER 0: GREEN - No debt
     if (balance <= 0) {
@@ -252,42 +282,34 @@ function determineSeverity(
         };
     }
 
-    // TIER 4: RED_SOLID_STRIKE - 15+ working days (Strike 3 zone)
-    if (workingDaysOverdue >= 15) {
-        const nextButton = getNextStrikeButton(activeStrikes, 3);
-        return {
-            tier: 4,
-            tierName: 'RED_SOLID_STRIKE',
-            color: '#FF3B3B',
-            label: 'Strike 3 Ready',
-            description: `${workingDaysOverdue} working days overdue`,
-            bannerText: activeStrikes === 2
-                ? `STRIKE 3 READY (90-DAY WINDOW ACTIVE) - ${workingDaysOverdue} WORKING DAYS OVERDUE`
-                : activeStrikes === 1
-                    ? 'STRIKE 3 READY (ISSUE STRIKE 2 NOTICE FIRST)'
-                    : 'STRIKE 3 READY (ISSUE STRIKE 1 & 2 FIRST)',
-            buttonText: nextButton
-        };
-    }
-
-    // TIER 3: RED_SOLID_STRIKE - 10-14 working days (Strike 2 zone)
-    if (workingDaysOverdue >= 10) {
-        const nextButton = getNextStrikeButton(activeStrikes, 2);
-        return {
-            tier: 3,
-            tierName: 'RED_SOLID_STRIKE',
-            color: '#FF3B3B',
-            label: 'Strike 2 Ready',
-            description: `${workingDaysOverdue} working days overdue`,
-            bannerText: activeStrikes === 1
-                ? `STRIKE 2 NOTICE READY - ${workingDaysOverdue} WORKING DAYS OVERDUE`
-                : 'STRIKE 2 READY (SEND STRIKE 1 NOTICE FIRST)',
-            buttonText: nextButton
-        };
-    }
-
-    // TIER 2: GOLD_SOLID - 5-9 working days (Strike 1 eligible)
-    if (workingDaysOverdue >= 5) {
+    // TIERS 2-4: Strike-eligible tiers (per-due-date model)
+    // Tier is determined by which strike number would be next, not cumulative days
+    if (canIssueStrike && nextStrikeNumber) {
+        if (nextStrikeNumber === 3 || activeStrikes >= 2) {
+            // TIER 4: RED_SOLID_STRIKE - Strike 3 eligible
+            return {
+                tier: 4,
+                tierName: 'RED_SOLID_STRIKE',
+                color: '#FF3B3B',
+                label: 'Strike 3 Ready',
+                description: `${workingDaysOverdue} working days overdue`,
+                bannerText: `STRIKE 3 READY (90-DAY WINDOW ACTIVE) - ${workingDaysOverdue} WORKING DAYS OVERDUE`,
+                buttonText: 'ISSUE STRIKE 3 NOTICE'
+            };
+        }
+        if (nextStrikeNumber === 2 || activeStrikes >= 1) {
+            // TIER 3: RED_SOLID_STRIKE - Strike 2 eligible
+            return {
+                tier: 3,
+                tierName: 'RED_SOLID_STRIKE',
+                color: '#FF3B3B',
+                label: 'Strike 2 Ready',
+                description: `${workingDaysOverdue} working days overdue`,
+                bannerText: `STRIKE 2 NOTICE READY - ${workingDaysOverdue} WORKING DAYS OVERDUE`,
+                buttonText: 'ISSUE STRIKE 2 NOTICE'
+            };
+        }
+        // TIER 2: GOLD_SOLID - Strike 1 eligible
         return {
             tier: 2,
             tierName: 'GOLD_SOLID',
@@ -295,7 +317,44 @@ function determineSeverity(
             label: 'Strike 1 Ready',
             description: `${workingDaysOverdue} working days overdue`,
             bannerText: `STRIKE 1 NOTICE READY - ${workingDaysOverdue} WORKING DAYS OVERDUE`,
-            buttonText: activeStrikes === 0 ? 'ISSUE STRIKE 1' : 'VIEW STRIKES'
+            buttonText: 'ISSUE STRIKE 1'
+        };
+    }
+
+    // If we have active strikes but no new one is eligible yet, still show elevated tier
+    if (activeStrikes >= 2 && workingDaysOverdue >= 5) {
+        return {
+            tier: 4,
+            tierName: 'RED_SOLID_STRIKE',
+            color: '#FF3B3B',
+            label: 'Strike Window Active',
+            description: `${activeStrikes} strikes in 90-day window`,
+            bannerText: `${activeStrikes} STRIKES ACTIVE - MONITORING FOR NEXT ELIGIBLE DUE DATE`,
+            buttonText: 'VIEW STRIKES'
+        };
+    }
+    if (activeStrikes >= 1 && workingDaysOverdue >= 5) {
+        return {
+            tier: 3,
+            tierName: 'RED_SOLID_STRIKE',
+            color: '#FF3B3B',
+            label: 'Strike Window Active',
+            description: `${activeStrikes} strike in 90-day window`,
+            bannerText: `${activeStrikes} STRIKE ACTIVE - MONITORING FOR NEXT ELIGIBLE DUE DATE`,
+            buttonText: 'VIEW STRIKES'
+        };
+    }
+
+    // 5+ working days overdue but no strike eligible (all due dates already struck)
+    if (workingDaysOverdue >= 5) {
+        return {
+            tier: 2,
+            tierName: 'GOLD_SOLID',
+            color: '#FBBF24',
+            label: 'Overdue',
+            description: `${workingDaysOverdue} working days overdue`,
+            bannerText: `${workingDaysOverdue} WORKING DAYS OVERDUE`,
+            buttonText: activeStrikes > 0 ? 'VIEW STRIKES' : 'ISSUE NOTICE'
         };
     }
 
@@ -313,6 +372,19 @@ function determineSeverity(
         };
     }
 
+    // Opening arrears with no missed cycles yet — show as amber (debt exists)
+    if (balance > 0) {
+        return {
+            tier: 1,
+            tierName: 'AMBER_OUTLINE',
+            color: '#D97706',
+            label: 'Outstanding',
+            description: 'Opening balance outstanding',
+            bannerText: '14-DAY NOTICE TO REMEDY READY',
+            buttonText: 'ISSUE NOTICE'
+        };
+    }
+
     // TIER 0: GREEN - Balance due but <1 working day overdue (payment due today/future)
     return {
         tier: 0,
@@ -325,79 +397,14 @@ function determineSeverity(
     };
 }
 
-/**
- * Get the correct button text for sequential strike issuance.
- * CRITICAL: Must send strikes in order (1 → 2 → 3).
- */
-function getNextStrikeButton(activeStrikes: number, targetStrike: number): string {
-    if (activeStrikes === 0) return 'ISSUE STRIKE 1 NOTICE';
-    if (activeStrikes === 1) return 'ISSUE STRIKE 2 NOTICE';
-    if (activeStrikes === 2) return 'ISSUE STRIKE 3 NOTICE';
-    return 'VIEW STRIKES';
-}
 
 // ============================================================================
 // STRIKE ELIGIBILITY
 // ============================================================================
-
-/**
- * Calculate strike eligibility based on working days and active strikes.
- *
- * RTA thresholds (sequential):
- * - Strike 1: 5+ working days overdue
- * - Strike 2: 10+ working days overdue (requires Strike 1 first)
- * - Strike 3: 15+ working days overdue (requires Strikes 1 & 2 first)
- */
-function calculateStrikeEligibility(
-    workingDaysOverdue: number,
-    activeStrikes: number
-): StrikeEligibility {
-    const canIssueStrike1 = workingDaysOverdue >= STRIKE_NOTICE_WORKING_DAYS && activeStrikes < 1;
-    const canIssueStrike2 = workingDaysOverdue >= STRIKE_NOTICE_WORKING_DAYS * 2 && activeStrikes >= 1 && activeStrikes < 2;
-    const canIssueStrike3 = workingDaysOverdue >= STRIKE_NOTICE_WORKING_DAYS * 3 && activeStrikes >= 2 && activeStrikes < 3;
-
-    // Determine next strike number (sequential order)
-    let nextStrikeNumber: number | null = null;
-    let nextStrikeThreshold: number | null = null;
-
-    if (canIssueStrike1) {
-        nextStrikeNumber = 1;
-        nextStrikeThreshold = STRIKE_NOTICE_WORKING_DAYS;
-    } else if (canIssueStrike2) {
-        nextStrikeNumber = 2;
-        nextStrikeThreshold = STRIKE_NOTICE_WORKING_DAYS * 2;
-    } else if (canIssueStrike3) {
-        nextStrikeNumber = 3;
-        nextStrikeThreshold = STRIKE_NOTICE_WORKING_DAYS * 3;
-    }
-
-    return {
-        canIssueStrike1,
-        canIssueStrike2,
-        canIssueStrike3,
-        activeStrikes,
-        nextStrikeNumber,
-        nextStrikeThreshold
-    };
-}
-
-/**
- * Count strikes within the 90-day rolling window.
- * Only counts STRIKE_1/2/3 notices (not REMEDY_NOTICE).
- * Uses officialServiceDate for the window calculation.
- */
-function countActiveStrikes(sentNotices: StrikeNotice[], effectiveDate: Date): number {
-    const windowStart = addDays(effectiveDate, -STRIKE_EXPIRY_DAYS);
-
-    return sentNotices.filter(notice => {
-        // Only count strike notices
-        if (notice.type === 'REMEDY_NOTICE') return false;
-
-        const osd = new Date(notice.officialServiceDate);
-        // Valid if within 0-90 days
-        return osd >= windowStart && osd <= effectiveDate;
-    }).length;
-}
+// Strike eligibility is now calculated by strike-eligibility.ts using
+// per-due-date tracking (RTA Section 55(1)(aa) "separate occasions").
+// See calculateStrikeEligibilityPerDueDate() in strike-eligibility.ts.
+// ============================================================================
 
 // ============================================================================
 // NOTICE ELIGIBILITY
@@ -423,8 +430,20 @@ function calculateNoticeEligibility(
     const hasRemedyNotice = !!remedyNoticeSentAt;
 
     let canApplyForTermination = false;
-    let terminationBasis: '21_day_rule' | 'three_strikes' | null = null;
+    let terminationBasis: '21_day_rule' | 'three_strikes' | 'section_56_expired' | null = null;
     let tribunalDeadlineDays: number | null = null;
+    let section56Expired = false;
+
+    // Path 0: Section 56 - 14-day remedy notice expired and debt not cleared
+    if (hasRemedyNotice && effectiveDate && isOverdue) {
+        const remedyOSD = new Date(remedyNoticeSentAt!);
+        const expiryDate = addDays(remedyOSD, 14);
+        if (effectiveDate > expiryDate) {
+            section56Expired = true;
+            canApplyForTermination = true;
+            terminationBasis = 'section_56_expired';
+        }
+    }
 
     // Path 1: 3 strikes within 90-day window → Section 55(1)(aa)
     if (activeStrikes >= MAX_STRIKES) {
@@ -446,11 +465,9 @@ function calculateNoticeEligibility(
     }
 
     // Path 2: 21+ calendar days overdue → Section 55(1)(a)
-    // This takes priority for display if both paths apply
     if (calendarDaysOverdue >= TERMINATION_ELIGIBLE_DAYS) {
         canApplyForTermination = true;
-        // Only override basis if 3-strike path isn't already set
-        if (!terminationBasis) {
+        if (!terminationBasis || terminationBasis === 'section_56_expired') {
             terminationBasis = '21_day_rule';
         }
     }
@@ -460,7 +477,8 @@ function calculateNoticeEligibility(
         hasRemedyNotice,
         canApplyForTermination,
         terminationBasis,
-        tribunalDeadlineDays
+        tribunalDeadlineDays,
+        section56Expired,
     };
 }
 
@@ -516,14 +534,18 @@ function generateDisplayText(rentState: RentCalculationResult): {
     }
 
     // Overdue
-    const sinceDate = rentState.oldestUnpaidDueDate
-        ? formatDateDisplay(rentState.oldestUnpaidDueDate, 'MMM d')
-        : '';
+    // If oldestUnpaidDueDate is null, debt is purely from opening arrears
+    // (no rent cycles have been missed yet) — show balance without overdue date
+    if (!rentState.oldestUnpaidDueDate) {
+        return {
+            primary: `$${rentState.currentBalance.toFixed(2)} outstanding`,
+            secondary: 'Opening balance'
+        };
+    }
 
+    const sinceDate = formatDateDisplay(rentState.oldestUnpaidDueDate, 'MMM d');
     return {
-        primary: sinceDate
-            ? `${rentState.daysOverdue} days overdue since ${sinceDate}`
-            : `${rentState.daysOverdue} days overdue`,
+        primary: `${rentState.daysOverdue} days overdue since ${sinceDate}`,
         secondary: `$${rentState.currentBalance.toFixed(2)} outstanding`
     };
 }
@@ -538,3 +560,5 @@ export type {
     RentCalculationResult,
     PaymentFrequency
 };
+
+export type { DueDateStrikeStatus } from "./strike-eligibility";

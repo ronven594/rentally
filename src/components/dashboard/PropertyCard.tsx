@@ -24,6 +24,7 @@ interface PropertyCardProps {
     onDeleteTenant: (tenantId: string) => void;
     onAddTenant: (propertyId: string) => void;
     onDeleteProperty: (propertyId: string) => void;
+    onNoticeSent?: () => Promise<void>;
     testDate?: Date;
 }
 
@@ -36,6 +37,7 @@ export function PropertyCard({
     onManageTenant,
     onAddTenant,
     onDeleteProperty,
+    onNoticeSent,
     testDate,
 }: PropertyCardProps) {
     const [isExpanded, setIsExpanded] = useState(true);
@@ -140,9 +142,12 @@ export function PropertyCard({
                                 status={tenantStatus}
                                 payments={allTenantPayments}
                                 propertyId={property.id}
+                                propertyAddress={property.address}
+                                region={(property.region || "Auckland") as any}
                                 onRecordPayment={onRecordPayment}
                                 onVoidPayment={onVoidPayment}
                                 onSettings={() => onManageTenant(tenant.id)}
+                                onNoticeSent={onNoticeSent}
                                 testDate={testDate}
                             />
                         );

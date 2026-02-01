@@ -15,7 +15,10 @@ import { Tenant, PaymentFrequency } from "@/types"
 import { User, Mail, Phone, Calendar, Loader2, UserPlus } from "lucide-react"
 import { supabase } from "@/lib/supabaseClient"
 import { toast } from "sonner"
-import { format, addDays, addWeeks, addMonths, parseISO } from "date-fns"
+import { format } from "date-fns"
+import { regeneratePaymentLedger } from "@/lib/ledger-regenerator"
+import { calculateArrearsStartDate } from "@/lib/rent-calculator"
+import { formatDateISO, getEffectiveToday } from "@/lib/date-utils"
 // SESSION 4: tenant-status-resolver is deprecated. Ledger records are display-only.
 // Status is derived at render time from calculateRentState() via deriveLedgerRecordStatus().
 
@@ -76,13 +79,37 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
 
         try {
             // Determine tracking start date and opening balance based on toggle
-            const finalTrackingStartDate = trackFromToday
-                ? format(new Date(), 'yyyy-MM-dd') // Track from today
-                : customTrackingDate; // Track from custom past date
-
+            //
+            // KEY INSIGHT: "Existing balance" means "total debt as of TODAY".
+            // It REPLACES any historical rent calculation, not adds to it.
+            // So we always track NEW rent from today, and store the existing
+            // debt as opening_arrears. The historical date goes into lease_start_date.
+            //
+            // We also back-calculate arrears_start_date: the estimated date when
+            // the debt originated. E.g. $600 at $400/fortnight = ~2 cycles back.
+            const todayDate = getEffectiveToday();
+            const today = formatDateISO(todayDate);
             const finalOpeningBalance = trackFromToday
-                ? 0 // No existing debt if tracking from today
-                : Number(existingBalance) || 0; // Use specified existing balance if backdating
+                ? 0
+                : Number(existingBalance) || 0;
+
+            // Always start tracking new rent from today.
+            const finalTrackingStartDate = today;
+
+            // Back-calculate when the debt started (for "overdue since" display)
+            const rentDueDay = frequency === 'Monthly'
+                ? parseInt(effectiveDueDay, 10) || 1
+                : effectiveDueDay;
+            const arrearsStart = finalOpeningBalance > 0
+                ? calculateArrearsStartDate(
+                    finalOpeningBalance,
+                    Number(amount),
+                    frequency,
+                    rentDueDay,
+                    todayDate
+                )
+                : null;
+            const arrearsStartDateISO = arrearsStart ? formatDateISO(arrearsStart) : null;
 
             console.log('🔍 SAVING TENANT:', {
                 frequency,
@@ -90,7 +117,8 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                 amount: Number(amount),
                 trackFromToday,
                 trackingStartDate: finalTrackingStartDate,
-                openingBalance: finalOpeningBalance
+                openingBalance: finalOpeningBalance,
+                arrearsStartDate: arrearsStartDateISO
             });
 
             const { data, error } = await supabase
@@ -101,10 +129,13 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                     last_name: lastName.trim(),
                     email: email || "",
                     phone: phone || "",
-                    lease_start_date: leaseStartDate || null, // Optional: actual lease start date (for reference)
-                    tracking_start_date: finalTrackingStartDate, // Required: when we started tracking
-                    opening_arrears: 0, // CRITICAL: Set to 0 because opening arrears are materialized as payment records below
-                    weekly_rent: Number(amount), // This stores the rent amount regardless of frequency
+                    lease_start_date: leaseStartDate || (trackFromToday ? null : customTrackingDate) || null,
+                    tracking_start_date: finalTrackingStartDate, // Always today - new rent accrues from here
+                    opening_arrears: finalOpeningBalance, // Existing debt at creation time (0 if new/paid up)
+                    arrears_start_date: arrearsStartDateISO, // Back-calculated: when debt originated
+                    settings_effective_date: finalTrackingStartDate, // Current settings effective from today
+                    carried_forward_balance: 0, // No carried forward balance on creation
+                    weekly_rent: Number(amount),
                     tenant_address: address,
                     is_active: true,
                     rent_due_day: effectiveDueDay,
@@ -117,162 +148,43 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
 
             if (data) {
                 // =====================================================================
-                // AI STATUS RESOLVER: Smart Payment Generation
+                // Generate display-only ledger records via regeneratePaymentLedger().
+                // Balance is calculated deterministically by calculateRentState(),
+                // so these records are purely for UI display of the payment schedule.
                 // =====================================================================
-                // CRITICAL LOGIC:
-                // If user says tenant is "$600 behind", we assume:
-                // - The tenant was PAYING older periods (historical payments)
-                // - They only fell behind on RECENT periods
-                //
-                // NEW APPROACH:
-                // 1. Generate ALL payment records from tracking start to today
-                // 2. Insert them all as Unpaid initially
-                // 3. Use AI Resolver to determine which should be marked Paid
-                // 4. Apply the resolved status
-                //
-                // Example: $600 behind, $400/fortnight, tracking Nov 1, today Jan 26
-                //   - Generate ALL periods: Nov 7, Nov 21, Dec 5, Dec 19, Jan 2, Jan 16
-                //   - Total if all unpaid: $2400
-                //   - But user said only $600 behind
-                //   - Resolver marks Nov 7-Dec 19 as Paid ($1800)
-                //   - Leaves Jan 2-16 as Unpaid ($600)
-                //   - "Overdue since Jan 2" ✅
-                // =====================================================================
-
                 if (finalTrackingStartDate) {
-                    const rentAmount = Number(amount);
-                    const today = new Date();
-                    const trackingStart = parseISO(finalTrackingStartDate);
-
-                    console.log('🤖 AI STATUS RESOLVER - Generating payment cycle:', {
-                        tenantName: `${firstName} ${lastName}`,
-                        openingBalance: finalOpeningBalance,
-                        rentAmount,
-                        frequency,
+                    const ledgerSettings = {
+                        id: data.id,
                         trackingStartDate: finalTrackingStartDate,
+                        rentAmount: Number(amount),
+                        frequency,
                         rentDueDay: effectiveDueDay,
-                        today: format(today, 'yyyy-MM-dd'),
-                        strategy: 'Generate ALL periods from tracking start, then use AI resolver'
+                        propertyId,
+                    };
+                    console.log('🔍 DEBUG: Calling regeneratePaymentLedger with:', {
+                        tenantId: data.id,
+                        settings: ledgerSettings,
                     });
 
-                    // Generate all due dates from tracking start to today
-                    const allDueDates: Date[] = [];
-                    let currentDueDate: Date;
+                    const result = await regeneratePaymentLedger(
+                        data.id,
+                        ledgerSettings,
+                        supabase
+                    );
 
-                    // Find first due date based on frequency
-                    if (frequency === 'Monthly') {
-                        // For Monthly: Find first occurrence of rentDueDay on or after tracking start
-                        const dayOfMonth = parseInt(effectiveDueDay, 10) || 1;
-                        const trackingMonth = trackingStart.getMonth();
-                        const trackingYear = trackingStart.getFullYear();
-
-                        const lastDayOfMonth = new Date(trackingYear, trackingMonth + 1, 0).getDate();
-                        const effectiveDay = Math.min(dayOfMonth, lastDayOfMonth);
-                        currentDueDate = new Date(trackingYear, trackingMonth, effectiveDay);
-
-                        // If that's before tracking start, move to next month
-                        if (currentDueDate < trackingStart) {
-                            const nextMonth = addMonths(currentDueDate, 1);
-                            const nextMonthLastDay = new Date(nextMonth.getFullYear(), nextMonth.getMonth() + 1, 0).getDate();
-                            const nextMonthEffectiveDay = Math.min(dayOfMonth, nextMonthLastDay);
-                            currentDueDate = new Date(nextMonth.getFullYear(), nextMonth.getMonth(), nextMonthEffectiveDay);
-                        }
-                    } else {
-                        // For Weekly/Fortnightly: Find first occurrence of rentDueDay on or after tracking start
-                        // DAYS_OF_WEEK = ["Monday", "Tuesday", ..., "Sunday"]
-                        const targetDayIndex = DAYS_OF_WEEK.indexOf(effectiveDueDay);
-                        const targetJsDay = targetDayIndex === 6 ? 0 : targetDayIndex + 1;
-                        const trackingStartJsDay = trackingStart.getDay();
-
-                        // Calculate days to add to reach target day of week
-                        let daysToAdd = (targetJsDay - trackingStartJsDay + 7) % 7;
-
-                        currentDueDate = addDays(trackingStart, daysToAdd);
-
-                        console.log('📅 Finding first due date for Weekly/Fortnightly:', {
-                            trackingStart: format(trackingStart, 'yyyy-MM-dd (EEEE)'),
-                            targetDay: effectiveDueDay,
-                            daysToAdd,
-                            firstDueDate: format(currentDueDate, 'yyyy-MM-dd (EEEE)')
-                        });
-                    }
-
-                    // Generate all due dates up to today
-                    const maxIterations = 520; // Safety limit
-                    let iterations = 0;
-
-                    while (currentDueDate <= today && iterations < maxIterations) {
-                        allDueDates.push(new Date(currentDueDate));
-                        iterations++;
-
-                        // Advance by frequency
-                        if (frequency === 'Weekly') {
-                            currentDueDate = addWeeks(currentDueDate, 1);
-                        } else if (frequency === 'Fortnightly') {
-                            currentDueDate = addWeeks(currentDueDate, 2);
-                        } else if (frequency === 'Monthly') {
-                            const dayOfMonth = parseInt(effectiveDueDay, 10) || 1;
-                            const nextMonth = addMonths(currentDueDate, 1);
-                            const lastDayOfNextMonth = new Date(
-                                nextMonth.getFullYear(),
-                                nextMonth.getMonth() + 1,
-                                0
-                            ).getDate();
-                            const effectiveDay = Math.min(dayOfMonth, lastDayOfNextMonth);
-                            currentDueDate = new Date(
-                                nextMonth.getFullYear(),
-                                nextMonth.getMonth(),
-                                effectiveDay
-                            );
-                        }
-                    }
-
-                    console.log('📅 Generated ALL payment periods:', {
-                        totalPeriods: allDueDates.length,
-                        firstDueDate: allDueDates.length > 0 ? format(allDueDates[0], 'yyyy-MM-dd') : 'None',
-                        lastDueDate: allDueDates.length > 0 ? format(allDueDates[allDueDates.length - 1], 'yyyy-MM-dd') : 'None',
-                        totalPotentialDebt: allDueDates.length * rentAmount
-                    });
-
-                    // =====================================================================
-                    // STEP 1: Create ALL payment records as Pending (display-only)
-                    // SESSION 4: Records are display-only. Status is derived at render
-                    // time from calculateRentState() via deriveLedgerRecordStatus().
-                    // =====================================================================
-                    const allPaymentRecords = allDueDates.map(dueDate => ({
-                        tenant_id: data.id,
-                        property_id: propertyId,
-                        due_date: format(dueDate, 'yyyy-MM-dd'),
-                        amount: rentAmount,
-                        status: 'Pending' as const,
-                        amount_paid: 0,
-                        paid_date: null
-                    }));
-
-                    console.log('📝 Creating ALL payment records initially as Unpaid:', {
-                        totalRecords: allPaymentRecords.length,
-                        totalDebtIfAllUnpaid: allPaymentRecords.length * rentAmount
-                    });
-
-                    const { data: insertedPayments, error: paymentError } = await supabase
-                        .from('payments')
-                        .insert(allPaymentRecords)
-                        .select();
-
-                    if (paymentError) {
-                        console.error('❌ Failed to create payment records:', paymentError);
+                    if (!result.success) {
+                        console.error('❌ Failed to create payment records:', result.error);
+                        console.error('❌ DEBUG: Full regeneration result:', JSON.stringify(result, null, 2));
                         toast.error('Tenant created but payment records failed. Please add manually.');
                         return;
                     }
 
-                    console.log('✅ Payment records created successfully');
+                    console.log('✅ Payment ledger created:', {
+                        recordsCreated: result.recordsCreated,
+                    });
 
-                    // SESSION 4: No resolver needed. Ledger records are display-only.
-                    // Balance and status are derived at render time from calculateRentState().
                     if (finalOpeningBalance > 0) {
                         toast.success(`${firstName} added with $${finalOpeningBalance.toFixed(2)} opening arrears`);
-                    } else {
-                        console.log('✅ No opening balance - tenant starts clean');
                     }
                 }
 
@@ -288,6 +200,9 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                     startDate: data.lease_start_date,
                     trackingStartDate: data.tracking_start_date,
                     openingArrears: data.opening_arrears || 0,
+                    arrearsStartDate: data.arrears_start_date || undefined,
+                    settingsEffectiveDate: data.settings_effective_date || undefined,
+                    carriedForwardBalance: data.carried_forward_balance || 0,
                     rentDueDay: effectiveDueDay
                 });
 
@@ -539,7 +454,7 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                                             />
                                         </div>
                                         <p className="text-[10px] text-white/40 font-medium">
-                                            When should we start tracking rent? (This is "Day 0" for arrears calculations)
+                                            When did the tenancy start? (Stored for your records. New rent tracks from today.)
                                         </p>
                                     </div>
 
@@ -560,7 +475,7 @@ export function AddTenantDialog({ open, onOpenChange, propertyId, propertyAddres
                                             />
                                         </div>
                                         <p className="text-[10px] text-white/40 font-medium">
-                                            How much rent are they behind? (leave as $0 if paid up)
+                                            Total amount they owe right now (leave as $0 if paid up)
                                         </p>
                                     </div>
                                 </div>

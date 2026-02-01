@@ -53,6 +53,12 @@ export interface RentSettings {
     openingArrears: number;
     /** Optional anchor date for fortnightly alignment */
     anchorDate?: string;
+    /**
+     * Back-calculated date when historical debt originated (ISO date string).
+     * Set at creation time when opening balance > 0.
+     * Used instead of trackingStartDate for "overdue since" display.
+     */
+    arrearsStartDate?: string | null;
 }
 
 export interface Payment {
@@ -307,8 +313,20 @@ export function calculateRentState(
     // STEP 9: Calculate overdue status
     // =========================================================================
     const isOverdue = currentBalance > 0;
+    const parsedArrearsStart = settings.arrearsStartDate
+        ? parseDateISO(settings.arrearsStartDate)
+        : null;
     const oldestUnpaidDueDate = isOverdue
-        ? calculateOldestUnpaidDueDate(cyclesPaidInFull, firstDueDate, dueDateSettings, settings.openingArrears > 0, trackingStart)
+        ? calculateOldestUnpaidDueDate(
+            cyclesPaidInFull,
+            firstDueDate,
+            dueDateSettings,
+            settings.openingArrears > 0,
+            trackingStart,
+            parsedArrearsStart,
+            currentBalance,
+            totalRentDue
+        )
         : null;
     const daysOverdue = oldestUnpaidDueDate
         ? Math.max(0, daysBetween(oldestUnpaidDueDate, effectiveDate))
@@ -434,23 +452,51 @@ function calculatePaidUntilDate(
  * Calculate the oldest unpaid due date
  *
  * This is the due date when the current debt started.
- * - If opening arrears exist, this is the tracking start date
- * - Otherwise, it's the (cyclesPaid + 1)th cycle's due date
+ *
+ * KEY LOGIC: We must check whether historical arrears are still outstanding
+ * before using arrearsStartDate. If payments have covered the historical debt,
+ * the "overdue since" date should shift to the first unpaid NEW rent cycle.
+ *
+ * How we determine if historical debt remains:
+ *   historicalDebtRemaining = max(0, currentBalance - totalRentDue)
+ *   - If > 0: some opening arrears are still unpaid → use arrearsStartDate
+ *   - If <= 0: opening arrears fully paid → find first unpaid new cycle
  */
 function calculateOldestUnpaidDueDate(
     cyclesPaid: number,
     firstDueDate: Date,
     settings: DueDateSettings,
     hasOpeningArrears: boolean,
-    trackingStartDate: Date
-): Date {
-    // If there are opening arrears, the debt started at tracking start
-    if (hasOpeningArrears && cyclesPaid === 0) {
-        return trackingStartDate;
+    trackingStartDate: Date,
+    arrearsStartDate: Date | null | undefined,
+    currentBalance: number,
+    totalRentDue: number
+): Date | null {
+    // How much of the current balance is from historical (opening) arrears?
+    // totalRentDue = new rent accrued since tracking started
+    // If currentBalance > totalRentDue, the excess is unpaid historical debt
+    const historicalDebtRemaining = Math.max(0, currentBalance - totalRentDue);
+
+    if (historicalDebtRemaining > 0 && arrearsStartDate) {
+        // Historical debt still partially unpaid — use the back-calculated date
+        return arrearsStartDate;
     }
 
-    // Otherwise, the oldest unpaid due date is the (cyclesPaid + 1)th cycle
-    // e.g., if 1 cycle is paid, the first unpaid is cycle 2
+    if (historicalDebtRemaining > 0 && hasOpeningArrears && !arrearsStartDate) {
+        // Legacy tenant: has unpaid historical debt but no arrearsStartDate
+        return null;
+    }
+
+    // Historical debt is fully paid (or never existed).
+    // Find the first unpaid NEW rent cycle.
+    if (cyclesPaid < 1 && hasOpeningArrears) {
+        // Edge case: no new cycles elapsed yet but historical debt paid off
+        // (balance could be from partial cycle or rounding)
+        return null;
+    }
+
+    // The oldest unpaid due date is the (cyclesPaid + 1)th cycle
+    // e.g., if 2 cycles elapsed and 1 paid, first unpaid = cycle 2
     return findDueDateForCycle(firstDueDate, settings, cyclesPaid + 1);
 }
 
@@ -488,6 +534,79 @@ function calculateNextDueDate(
 }
 
 // ============================================================================
+// ARREARS START DATE CALCULATION
+// ============================================================================
+
+/**
+ * Calculate when historical debt originated by working backwards from
+ * the next due date.
+ *
+ * Example: $600 opening, $400 fortnightly Fridays, reference date Jan 28
+ *   - cyclesOwed = ceil(600/400) = 2
+ *   - Next Friday after Jan 28 = Jan 31
+ *   - Arrears start = Jan 31 - (2 × 14 days) = Jan 3
+ *   - Meaning: the tenant has been behind since Jan 3
+ *
+ * @param openingArrears - The opening balance amount
+ * @param rentAmount - Rent per cycle
+ * @param frequency - Payment frequency
+ * @param dueDay - Day rent is due
+ * @param referenceDate - Usually the creation date (today)
+ * @returns The calculated arrears start date, or null if no arrears
+ */
+export function calculateArrearsStartDate(
+    openingArrears: number,
+    rentAmount: number,
+    frequency: PaymentFrequency,
+    dueDay: string | number,
+    referenceDate: Date
+): Date | null {
+    if (openingArrears <= 0 || rentAmount <= 0) {
+        return null;
+    }
+
+    const cyclesOwed = Math.ceil(openingArrears / rentAmount);
+
+    const dueDateSettings: DueDateSettings = {
+        frequency,
+        dueDay
+    };
+
+    // Find the next due date on or after the reference date
+    const nextDue = findFirstDueDate(referenceDate, dueDateSettings);
+
+    // Work backwards by cyclesOwed cycles
+    let arrearsStart = nextDue;
+    for (let i = 0; i < cyclesOwed; i++) {
+        arrearsStart = retreatDueDate(arrearsStart, dueDateSettings);
+    }
+
+    return startOfDay(arrearsStart);
+}
+
+/**
+ * Retreat a due date by one cycle (inverse of advanceDueDate)
+ */
+function retreatDueDate(currentDue: Date, settings: DueDateSettings): Date {
+    const normalized = startOfDay(currentDue);
+
+    if (settings.frequency === 'Weekly') {
+        return addDays(normalized, -7);
+    } else if (settings.frequency === 'Fortnightly') {
+        return addDays(normalized, -14);
+    } else {
+        // Monthly - go back one month, snap to target day
+        const targetDay = typeof settings.dueDay === 'number'
+            ? settings.dueDay
+            : parseInt(settings.dueDay as string, 10) || 1;
+        const prevMonth = new Date(normalized.getFullYear(), normalized.getMonth() - 1, 1);
+        const daysInPrevMonth = new Date(prevMonth.getFullYear(), prevMonth.getMonth() + 1, 0).getDate();
+        const effectiveDay = Math.min(targetDay, daysInPrevMonth);
+        return new Date(prevMonth.getFullYear(), prevMonth.getMonth(), effectiveDay);
+    }
+}
+
+// ============================================================================
 // CONVENIENCE FUNCTIONS
 // ============================================================================
 
@@ -503,6 +622,7 @@ export function toRentSettings(tenant: {
     rentDueDay: string;
     trackingStartDate?: string;
     openingArrears?: number;
+    arrearsStartDate?: string | null;
 }): RentSettings {
     return {
         frequency: tenant.frequency,
@@ -511,7 +631,8 @@ export function toRentSettings(tenant: {
             ? parseInt(tenant.rentDueDay, 10) || 1
             : tenant.rentDueDay,
         trackingStartDate: tenant.trackingStartDate || formatDateISO(new Date()),
-        openingArrears: tenant.openingArrears || 0
+        openingArrears: tenant.openingArrears || 0,
+        arrearsStartDate: tenant.arrearsStartDate || null
     };
 }
 

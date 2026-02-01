@@ -19,9 +19,13 @@ import {
     calculateOfficialServiceDate,
     calculateRemedyExpiryDate,
     calculateTribunalDeadline,
+    addWorkingDays,
     type NoticeType,
 } from "@/lib/legal-engine";
 import { type NZRegion } from "@/lib/nz-holidays";
+import { getNextWorkingDay, isNZWorkingDay, NZ_TIMEZONE } from "@/lib/date-utils";
+import { toZonedTime } from "date-fns-tz";
+import { startOfDay } from "date-fns";
 import { sendNoticeEmailWithAttachment } from "@/lib/mail";
 import { generateNoticePDF } from "@/lib/pdf-generator";
 
@@ -54,6 +58,14 @@ interface SendNoticeRequest {
     // Previous strike info for the PDF
     firstStrikeDate?: string;
     previousNotices?: { date: string }[];
+    // Manual delivery options
+    downloadOnly?: boolean;       // Generate PDF without saving record or sending email
+    manualDelivery?: boolean;     // Save record without sending email
+    deliveryMethod?: "hand" | "post" | "letterbox"; // For manual delivery OSD calculation
+    // Test date override (ISO string) - uses this instead of real date for all calculations
+    testDate?: string;
+    // Field overrides from editable preview
+    fieldOverrides?: Record<string, string>;
 }
 
 interface NoticeRecord {
@@ -67,6 +79,8 @@ interface NoticeRecord {
     expiry_date: string | null;
     tribunal_deadline: string | null;
     rent_due_date: string | null;
+    /** Which specific rent due date this strike is for (RTA "separate occasion") */
+    due_date_for: string | null;
     amount_owed: number | null;
     email_sent: boolean;
     email_sent_at: string | null;
@@ -103,11 +117,231 @@ export async function POST(request: NextRequest) {
         }
 
         // Step 1: Calculate all legal dates using TypeScript (NOT AI)
-        const sentTimestamp = new Date().toISOString();
+        // Test mode: use test DATE but real TIME (so 5pm cutoff works correctly)
+        let effectiveNow: Date;
+        if (body.testDate) {
+            const testD = new Date(body.testDate);
+            const now = new Date();
+            effectiveNow = new Date(
+                testD.getFullYear(), testD.getMonth(), testD.getDate(),
+                now.getHours(), now.getMinutes(), now.getSeconds(), now.getMilliseconds()
+            );
+        } else {
+            effectiveNow = new Date();
+        }
+        const sentTimestamp = effectiveNow.toISOString();
         const region = body.region || "Auckland";
 
-        // Calculate Official Service Date (5PM rule + working day validation)
-        const officialServiceDate = calculateOfficialServiceDate(sentTimestamp, region);
+        // Apply field overrides from editable preview
+        const fo = body.fieldOverrides || {};
+        const foNum = (key: string) => fo[key] ? parseFloat(fo[key]) : undefined;
+
+        // Block duplicate strike for same due date (RTA Section 55(1)(aa) - separate occasions)
+        if (body.noticeType === "S55_STRIKE" && body.rentDueDate) {
+            const { data: existingStrike } = await supabaseAdmin
+                .from("notices")
+                .select("id")
+                .eq("tenant_id", body.tenantId)
+                .eq("is_strike", true)
+                .eq("due_date_for", body.rentDueDate)
+                .limit(1);
+
+            if (existingStrike && existingStrike.length > 0) {
+                return NextResponse.json(
+                    { error: "A strike notice has already been issued for this rent due date. Each strike must be for a separate occasion (different due date) per RTA Section 55(1)(aa)." },
+                    { status: 400 }
+                );
+            }
+        }
+
+        // Block same-day consecutive strikes
+        if (body.noticeType === "S55_STRIKE" && body.strikeNumber && body.strikeNumber > 1) {
+            const todayStr = format(new Date(), "yyyy-MM-dd");
+            const { data: todayStrikes } = await supabaseAdmin
+                .from("notices")
+                .select("id")
+                .eq("tenant_id", body.tenantId)
+                .eq("is_strike", true)
+                .gte("sent_at", `${todayStr}T00:00:00`)
+                .lte("sent_at", `${todayStr}T23:59:59`)
+                .limit(1);
+
+            if (todayStrikes && todayStrikes.length > 0) {
+                return NextResponse.json(
+                    { error: "You must wait until tomorrow to send the next strike notice. Each strike must be on a separate day." },
+                    { status: 400 }
+                );
+            }
+        }
+
+        // Handle downloadOnly mode: generate PDF and return it without saving or emailing
+        if (body.downloadOnly) {
+            if (body.noticeType !== "S55_STRIKE" && body.noticeType !== "S56_REMEDY") {
+                return NextResponse.json(
+                    { error: "PDF download only available for S55_STRIKE and S56_REMEDY notices" },
+                    { status: 400 }
+                );
+            }
+
+            const previewOSD = calculateOfficialServiceDate(sentTimestamp, region);
+            const previewExpiry = body.noticeType === "S56_REMEDY"
+                ? calculateRemedyExpiryDate(previewOSD) : undefined;
+
+            // Look up previous strikes for PDF fields
+            let dlPrevOSDs: string[] = [];
+            if (body.noticeType === "S55_STRIKE" && body.strikeNumber && body.strikeNumber > 1) {
+                const ninetyDaysAgo = format(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000), "yyyy-MM-dd");
+                const { data: prevStrikes } = await supabaseAdmin
+                    .from("notices")
+                    .select("official_service_date")
+                    .eq("tenant_id", body.tenantId)
+                    .eq("is_strike", true)
+                    .gte("official_service_date", ninetyDaysAgo)
+                    .order("official_service_date", { ascending: true });
+                if (prevStrikes) {
+                    dlPrevOSDs = prevStrikes.map(s => String(s.official_service_date).split("-").reverse().join("/"));
+                }
+            }
+
+            // Calculate per-due-date unpaid for download preview
+            let dlAmountUnpaid: number | undefined;
+            if (body.noticeType === "S55_STRIKE" && body.rentDueDate) {
+                const { data: dueDatePayments } = await supabaseAdmin
+                    .from("payments")
+                    .select("amount_paid")
+                    .eq("tenant_id", body.tenantId)
+                    .eq("due_date", body.rentDueDate);
+                const paidForDueDate = dueDatePayments?.reduce((sum, p) => sum + (p.amount_paid || 0), 0) || 0;
+                dlAmountUnpaid = (body.rentAmount || body.amountOwed || 0) - paidForDueDate;
+                if (dlAmountUnpaid < 0) dlAmountUnpaid = 0;
+            }
+
+            // For remedy notices: query last payment and next rent due date
+            let dlLastPaymentAmount: number | undefined;
+            let dlLastPaymentDate: string | undefined;
+            let dlNextRentDueDate: string | undefined;
+
+            if (body.noticeType === "S56_REMEDY") {
+                // Query payments with actual money applied (amount_paid > 0)
+                const { data: paidPayments, error: payErr } = await supabaseAdmin
+                    .from("payments")
+                    .select("amount_paid, paid_date, due_date, status")
+                    .eq("tenant_id", body.tenantId)
+                    .gt("amount_paid", 0)
+                    .order("due_date", { ascending: false })
+                    .limit(1);
+
+                console.log("=== DOWNLOADONLY REMEDY: Payment query ===");
+                console.log("Tenant ID:", body.tenantId);
+                console.log("Query error:", payErr?.message || "none");
+                console.log("Paid payments:", JSON.stringify(paidPayments, null, 2));
+
+                if (paidPayments && paidPayments.length > 0) {
+                    const latest = paidPayments[0];
+                    dlLastPaymentAmount = latest.amount_paid;
+                    dlLastPaymentDate = latest.due_date; // Use due_date as the payment reference date
+                    console.log("Last payment:", dlLastPaymentAmount, "for due date:", dlLastPaymentDate);
+                }
+
+                // Calculate next rent due date
+                const { data: tenantData } = await supabaseAdmin
+                    .from("tenants")
+                    .select("frequency, rent_due_day, tracking_start_date")
+                    .eq("id", body.tenantId)
+                    .single();
+
+                if (tenantData?.frequency && tenantData?.rent_due_day && tenantData?.tracking_start_date) {
+                    const { findFirstDueDate, findNextDueDate } = await import("@/lib/date-utils");
+                    const dueDateSettings = {
+                        frequency: tenantData.frequency as "Weekly" | "Fortnightly" | "Monthly",
+                        dueDay: tenantData.rent_due_day,
+                    };
+                    const trackStart = new Date(tenantData.tracking_start_date + "T12:00:00");
+                    const firstDue = findFirstDueDate(trackStart, dueDateSettings);
+                    const nextDue = findNextDueDate(effectiveNow, dueDateSettings, firstDue);
+                    dlNextRentDueDate = format(nextDue, "yyyy-MM-dd");
+                }
+            }
+
+            try {
+                const pdfResult = await generateNoticePDF(body.noticeType, {
+                    tenantName: fo.tenantName || body.tenantName,
+                    tenantAddress: fo.tenantAddress || body.tenantAddress || body.propertyAddress,
+                    propertyAddress: fo.propertyAddress || body.propertyAddress,
+                    amountOwed: foNum("amountOwed") ?? body.amountOwed ?? 0,
+                    rentAmount: foNum("rentAmount") ?? body.rentAmount,
+                    amountUnpaidForDueDate: dlAmountUnpaid ?? body.rentAmount ?? body.amountOwed ?? 0,
+                    rentDueDate: fo.rentDueDate || body.rentDueDate,
+                    strikeNumber: body.strikeNumber as 1 | 2 | 3,
+                    firstStrikeDate: dlPrevOSDs[0] || previewOSD.split("-").reverse().join("/"),
+                    previousNotices: dlPrevOSDs.length > 0
+                        ? dlPrevOSDs.map(d => ({ date: d }))
+                        : body.previousNotices,
+                    paymentDeadline: fo.paymentDeadline || previewExpiry,
+                    lastPaymentAmount: foNum("lastPaymentAmount") ?? dlLastPaymentAmount,
+                    lastPaymentDate: fo.lastPaymentDate || dlLastPaymentDate,
+                    nextRentDueDate: fo.nextRentDueDate || dlNextRentDueDate,
+                    landlordName: fo.landlordName || body.landlordName || "Landlord",
+                    landlordPhone: fo.landlordPhone || body.landlordPhone,
+                    landlordMobile: fo.landlordMobile || body.landlordMobile,
+                    landlordEmail: fo.landlordEmail || body.landlordEmail,
+                    landlordAddress: fo.landlordAddress || body.landlordAddress,
+                    officialServiceDate: previewOSD,
+                    testDate: body.testDate,
+                });
+
+                return new Response(Buffer.from(pdfResult.pdfBytes), {
+                    headers: {
+                        "Content-Type": "application/pdf",
+                        "Content-Disposition": `attachment; filename="${pdfResult.filename}"`,
+                    },
+                });
+            } catch (pdfError: any) {
+                return NextResponse.json(
+                    { error: "PDF generation failed", details: pdfError.message },
+                    { status: 500 }
+                );
+            }
+        }
+
+        // Calculate Official Service Date based on delivery method
+        let officialServiceDate: string;
+
+        if (body.manualDelivery && body.deliveryMethod) {
+            // Manual delivery: OSD depends on delivery method per RTA Section 136
+            const nowNZ = toZonedTime(new Date(), NZ_TIMEZONE);
+            const todayNZ = startOfDay(nowNZ);
+            const hourNZ = nowNZ.getHours();
+
+            switch (body.deliveryMethod) {
+                case "hand": {
+                    // Hand delivered: OSD = today if before 5 PM on working day, else next working day
+                    if (hourNZ < 17 && isNZWorkingDay(todayNZ, region)) {
+                        officialServiceDate = format(todayNZ, "yyyy-MM-dd");
+                    } else {
+                        officialServiceDate = format(getNextWorkingDay(todayNZ, region), "yyyy-MM-dd");
+                    }
+                    break;
+                }
+                case "letterbox": {
+                    // Letterbox: OSD = today + 2 working days
+                    const osd = addWorkingDays(todayNZ, 2, region);
+                    officialServiceDate = format(osd, "yyyy-MM-dd");
+                    break;
+                }
+                case "post": {
+                    // Posted: OSD = today + 4 working days
+                    const osd = addWorkingDays(todayNZ, 4, region);
+                    officialServiceDate = format(osd, "yyyy-MM-dd");
+                    break;
+                }
+                default:
+                    officialServiceDate = calculateOfficialServiceDate(sentTimestamp, region);
+            }
+        } else {
+            // Email delivery: standard 5 PM rule
+            officialServiceDate = calculateOfficialServiceDate(sentTimestamp, region);
+        }
 
         // Calculate expiry date for remedy notices (14 days)
         const expiryDate = body.noticeType === "S56_REMEDY"
@@ -122,7 +356,123 @@ export async function POST(request: NextRequest) {
         // Determine if this is a strike notice
         const isStrike = body.noticeType === "S55_STRIKE" || body.noticeType === "S55A_SOCIAL";
 
-        // Step 2: Generate PDF notice using official templates
+        // Step 2a: Calculate per-due-date unpaid amount (for strike notices)
+        let amountUnpaidForDueDate: number | undefined;
+        if (isStrike && body.rentDueDate) {
+            const { data: dueDatePayments } = await supabaseAdmin
+                .from("payments")
+                .select("amount_paid")
+                .eq("tenant_id", body.tenantId)
+                .eq("due_date", body.rentDueDate);
+
+            const paidForDueDate = dueDatePayments?.reduce((sum, p) => sum + (p.amount_paid || 0), 0) || 0;
+            amountUnpaidForDueDate = (body.rentAmount || body.amountOwed || 0) - paidForDueDate;
+            if (amountUnpaidForDueDate < 0) amountUnpaidForDueDate = 0;
+        }
+
+        // Step 2b: Look up previous strikes from DB (authoritative source for PDF fields)
+        let previousStrikeOSDs: string[] = [];
+        let previousStrikeFilePaths: string[] = [];
+        if (isStrike && body.strikeNumber && body.strikeNumber > 1) {
+            const ninetyDaysAgo = format(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000), "yyyy-MM-dd");
+            const { data: prevStrikes } = await supabaseAdmin
+                .from("notices")
+                .select("official_service_date, file_path, strike_number")
+                .eq("tenant_id", body.tenantId)
+                .eq("is_strike", true)
+                .gte("official_service_date", ninetyDaysAgo)
+                .order("official_service_date", { ascending: true });
+
+            if (prevStrikes) {
+                previousStrikeOSDs = prevStrikes.map(s => {
+                    const d = String(s.official_service_date); // yyyy-MM-dd from DB
+                    return d.split("-").reverse().join("/");
+                });
+                previousStrikeFilePaths = prevStrikes
+                    .map(s => s.file_path)
+                    .filter((p): p is string => !!p);
+            }
+        }
+
+        // Step 2c: For remedy notices, look up last payment and next rent due date
+        let lastPaymentAmount: number | undefined;
+        let lastPaymentDate: string | undefined;
+        let nextRentDueDate: string | undefined;
+
+        if (body.noticeType === "S56_REMEDY") {
+            // Query payments with actual money applied (amount_paid > 0)
+            const { data: paidPayments, error: payErr } = await supabaseAdmin
+                .from("payments")
+                .select("amount_paid, paid_date, due_date, status")
+                .eq("tenant_id", body.tenantId)
+                .gt("amount_paid", 0)
+                .order("due_date", { ascending: false })
+                .limit(1);
+
+            console.log("=== REMEDY NOTICE: Payment query ===");
+            console.log("Tenant ID:", body.tenantId);
+            console.log("Query error:", payErr?.message || "none");
+            console.log("Paid payments:", JSON.stringify(paidPayments, null, 2));
+
+            if (paidPayments && paidPayments.length > 0) {
+                const latest = paidPayments[0];
+                lastPaymentAmount = latest.amount_paid;
+                lastPaymentDate = latest.due_date; // Use due_date as the payment reference date
+                console.log("Last payment:", lastPaymentAmount, "for due date:", lastPaymentDate);
+            }
+
+            const { data: tenantData } = await supabaseAdmin
+                .from("tenants")
+                .select("frequency, rent_due_day, tracking_start_date")
+                .eq("id", body.tenantId)
+                .single();
+
+            // Calculate next rent due date after the notice date
+            if (tenantData?.frequency && tenantData?.rent_due_day && tenantData?.tracking_start_date) {
+                const { findFirstDueDate, findNextDueDate } = await import("@/lib/date-utils");
+                const dueDateSettings = {
+                    frequency: tenantData.frequency as "Weekly" | "Fortnightly" | "Monthly",
+                    dueDay: tenantData.rent_due_day,
+                };
+                const trackStart = new Date(tenantData.tracking_start_date + "T12:00:00");
+                const firstDue = findFirstDueDate(trackStart, dueDateSettings);
+                const nextDue = findNextDueDate(effectiveNow, dueDateSettings, firstDue);
+                nextRentDueDate = format(nextDue, "yyyy-MM-dd");
+            }
+        }
+
+        // Step 2d: Build debt snapshot for remedy notices (captures SPECIFIC debt at time of notice)
+        let debtSnapshot: {
+            ledger_entry_ids: string[];
+            due_dates: string[];
+            total_amount_owed: number;
+            unpaid_amounts: Record<string, number>;
+        } | null = null;
+
+        if (body.noticeType === "S56_REMEDY") {
+            const { data: unpaidEntries } = await supabaseAdmin
+                .from("payments")
+                .select("id, due_date, amount, amount_paid, status")
+                .eq("tenant_id", body.tenantId)
+                .in("status", ["Unpaid", "Partial"]);
+
+            debtSnapshot = {
+                ledger_entry_ids: unpaidEntries?.map(e => e.id) || [],
+                due_dates: unpaidEntries?.map(e => e.due_date) || [],
+                total_amount_owed: unpaidEntries?.reduce((sum, e) => {
+                    const unpaid = e.amount - (e.amount_paid || 0);
+                    return sum + unpaid;
+                }, 0) || 0,
+                unpaid_amounts: Object.fromEntries(
+                    unpaidEntries?.map(e => [
+                        e.due_date,
+                        e.amount - (e.amount_paid || 0)
+                    ]) || []
+                ),
+            };
+        }
+
+        // Step 2e: Generate PDF notice using official templates
         let pdfData: { pdfBytes: Uint8Array; filename: string } | null = null;
 
         if (body.noticeType === "S55_STRIKE" || body.noticeType === "S56_REMEDY") {
@@ -130,22 +480,29 @@ export async function POST(request: NextRequest) {
                 pdfData = await generateNoticePDF(
                     body.noticeType,
                     {
-                        tenantName: body.tenantName,
-                        tenantAddress: body.tenantAddress || body.propertyAddress,
-                        propertyAddress: body.propertyAddress,
-                        amountOwed: body.amountOwed || 0,
-                        rentAmount: body.rentAmount,
-                        rentDueDate: body.rentDueDate,
+                        tenantName: fo.tenantName || body.tenantName,
+                        tenantAddress: fo.tenantAddress || body.tenantAddress || body.propertyAddress,
+                        propertyAddress: fo.propertyAddress || body.propertyAddress,
+                        amountOwed: foNum("amountOwed") ?? body.amountOwed ?? 0,
+                        rentAmount: foNum("rentAmount") ?? body.rentAmount,
+                        amountUnpaidForDueDate: amountUnpaidForDueDate ?? body.rentAmount ?? body.amountOwed ?? 0,
+                        rentDueDate: fo.rentDueDate || body.rentDueDate,
                         strikeNumber: body.strikeNumber as 1 | 2 | 3,
-                        firstStrikeDate: body.firstStrikeDate,
-                        previousNotices: body.previousNotices,
-                        paymentDeadline: expiryDate || undefined,
-                        landlordName: body.landlordName || "Landlord",
-                        landlordPhone: body.landlordPhone,
-                        landlordMobile: body.landlordMobile,
-                        landlordEmail: body.landlordEmail,
-                        landlordAddress: body.landlordAddress,
+                        firstStrikeDate: previousStrikeOSDs[0] || officialServiceDate.split("-").reverse().join("/"),
+                        previousNotices: previousStrikeOSDs.length > 0
+                            ? previousStrikeOSDs.map(d => ({ date: d }))
+                            : body.previousNotices,
+                        paymentDeadline: fo.paymentDeadline || expiryDate || undefined,
+                        lastPaymentAmount: foNum("lastPaymentAmount") ?? lastPaymentAmount,
+                        lastPaymentDate: fo.lastPaymentDate || lastPaymentDate,
+                        nextRentDueDate: fo.nextRentDueDate || nextRentDueDate,
+                        landlordName: fo.landlordName || body.landlordName || "Landlord",
+                        landlordPhone: fo.landlordPhone || body.landlordPhone,
+                        landlordMobile: fo.landlordMobile || body.landlordMobile,
+                        landlordEmail: fo.landlordEmail || body.landlordEmail,
+                        landlordAddress: fo.landlordAddress || body.landlordAddress,
                         officialServiceDate,
+                        testDate: body.testDate,
                     }
                 );
             } catch (pdfError) {
@@ -206,6 +563,7 @@ export async function POST(request: NextRequest) {
             expiry_date: expiryDate,
             tribunal_deadline: tribunalDeadline,
             rent_due_date: body.rentDueDate || null,
+            due_date_for: isStrike ? (body.rentDueDate || null) : null,
             amount_owed: body.amountOwed || null,
             email_sent: false,
             email_sent_at: null,
@@ -218,6 +576,12 @@ export async function POST(request: NextRequest) {
             metadata: {
                 region,
                 generatedAt: sentTimestamp,
+                ...(body.noticeType === "S56_REMEDY" && debtSnapshot ? {
+                    ledger_entry_ids: debtSnapshot.ledger_entry_ids,
+                    due_dates: debtSnapshot.due_dates,
+                    total_amount_owed: debtSnapshot.total_amount_owed,
+                    unpaid_amounts: debtSnapshot.unpaid_amounts,
+                } : {}),
             },
         };
 
@@ -230,54 +594,144 @@ export async function POST(request: NextRequest) {
 
         if (dbError) {
             console.error("Database Error:", dbError);
+            console.error("Notice record attempted:", JSON.stringify(noticeRecord, null, 2));
             return NextResponse.json(
-                { error: "Failed to save notice to database", details: dbError.message },
+                { error: "Failed to save notice to database", details: dbError.message, code: dbError.code, hint: dbError.hint },
                 { status: 500 }
             );
         }
 
-        // Step 7: Send email via Resend (with PDF attachment if available)
-        let emailResult;
+        // Step 7: Send email or mark as manually delivered
+        let emailResult: { success: boolean; id?: string; error?: any };
+        let emailSentAt: string | null = null;
 
-        if (pdfData) {
-            // Send with PDF attachment - the legal weight is in the PDF
-            emailResult = await sendNoticeEmailWithAttachment(
-                body.tenantEmail,
-                emailContent.subject,
-                emailContent.html,
-                {
-                    filename: pdfData.filename,
-                    content: Buffer.from(pdfData.pdfBytes),
-                    contentType: "application/pdf",
-                }
-            );
+        if (body.manualDelivery) {
+            // Manual delivery: skip email, mark as sent immediately
+            emailResult = { success: true, id: `manual_${body.deliveryMethod}` };
+
+            const { error: updateError } = await supabaseAdmin
+                .from("notices")
+                .update({
+                    email_sent: false,
+                    email_sent_at: null,
+                    email_id: null,
+                    status: "sent",
+                    metadata: {
+                        ...noticeRecord.metadata,
+                        deliveryMethod: body.deliveryMethod,
+                        manualDelivery: true,
+                    },
+                })
+                .eq("id", savedNotice.id);
+
+            if (updateError) {
+                console.error("Failed to update notice status:", updateError);
+            }
         } else {
-            // Fallback to HTML-only email if PDF generation failed
-            const { sendNoticeEmail } = await import("@/lib/mail");
-            emailResult = await sendNoticeEmail(
-                body.tenantEmail,
-                emailContent.subject,
-                emailContent.html
-            );
+            // Email delivery
+            if (pdfData) {
+                // Fetch previous strike PDFs from storage for Strike 2/3
+                const previousPdfAttachments: { filename: string; content: Buffer; contentType: string }[] = [];
+                if (isStrike && body.strikeNumber && body.strikeNumber > 1 && previousStrikeFilePaths.length > 0) {
+                    for (const filePath of previousStrikeFilePaths) {
+                        try {
+                            const { data: fileData, error: dlError } = await supabaseAdmin.storage
+                                .from("notices")
+                                .download(filePath);
+                            if (fileData && !dlError) {
+                                const buf = Buffer.from(await fileData.arrayBuffer());
+                                const name = filePath.split("/").pop() || `previous_notice.pdf`;
+                                previousPdfAttachments.push({
+                                    filename: name,
+                                    content: buf,
+                                    contentType: "application/pdf",
+                                });
+                            }
+                        } catch {
+                            console.error("Failed to download previous strike PDF:", filePath);
+                        }
+                    }
+                }
+
+                emailResult = await sendNoticeEmailWithAttachment(
+                    body.tenantEmail,
+                    emailContent.subject,
+                    emailContent.html,
+                    {
+                        filename: pdfData.filename,
+                        content: Buffer.from(pdfData.pdfBytes),
+                        contentType: "application/pdf",
+                    },
+                    previousPdfAttachments.length > 0 ? previousPdfAttachments : undefined
+                );
+            } else {
+                const { sendNoticeEmail } = await import("@/lib/mail");
+                emailResult = await sendNoticeEmail(
+                    body.tenantEmail,
+                    emailContent.subject,
+                    emailContent.html
+                );
+            }
+
+            // Step 8: Update notice with email delivery status
+            emailSentAt = new Date().toISOString();
+            const { error: updateError } = await supabaseAdmin
+                .from("notices")
+                .update({
+                    email_sent: emailResult.success,
+                    email_sent_at: emailResult.success ? emailSentAt : null,
+                    email_id: emailResult.id || null,
+                    status: emailResult.success ? "sent" : "failed",
+                })
+                .eq("id", savedNotice.id);
+
+            if (updateError) {
+                console.error("Failed to update notice status:", updateError);
+            }
         }
 
-        // Step 8: Update notice with email delivery status
-        const emailSentAt = new Date().toISOString();
-        const { error: updateError } = await supabaseAdmin
-            .from("notices")
-            .update({
-                email_sent: emailResult.success,
-                email_sent_at: emailResult.success ? emailSentAt : null,
-                email_id: emailResult.id || null,
-                status: emailResult.success ? "sent" : "failed",
-            })
-            .eq("id", savedNotice.id);
+        // Step 9: Update tenant record with notice info for client-side status calculation
+        if (isStrike && body.strikeNumber) {
+            try {
+                // Fetch current sent_notices from tenant
+                const { data: tenantData } = await supabaseAdmin
+                    .from("tenants")
+                    .select("sent_notices, remedy_notice_sent_at")
+                    .eq("id", body.tenantId)
+                    .single();
 
-        if (updateError) {
-            console.error("Failed to update notice status:", updateError);
+                const currentNotices = tenantData?.sent_notices || [];
+                const strikeTypeMap: Record<number, string> = { 1: "STRIKE_1", 2: "STRIKE_2", 3: "STRIKE_3" };
+                const newNotice = {
+                    id: savedNotice.id,
+                    type: strikeTypeMap[body.strikeNumber] || "STRIKE_1",
+                    sentAt: sentTimestamp.split("T")[0],
+                    officialServiceDate,
+                    dueDateFor: body.rentDueDate || null,
+                };
+
+                await supabaseAdmin
+                    .from("tenants")
+                    .update({ sent_notices: [...currentNotices, newNotice] })
+                    .eq("id", body.tenantId);
+            } catch (syncErr) {
+                console.error("Failed to sync sent_notices to tenant record:", syncErr);
+                // Non-fatal: the notices table is the source of truth
+            }
         }
 
-        // Step 9: Return response
+        if (body.noticeType === "S56_REMEDY") {
+            try {
+                await supabaseAdmin
+                    .from("tenants")
+                    .update({ remedy_notice_sent_at: sentTimestamp.split("T")[0] })
+                    .eq("id", body.tenantId);
+            } catch (syncErr) {
+                console.error("Failed to sync remedy_notice_sent_at:", syncErr);
+            }
+        }
+
+        // Step 10: Return response
         return NextResponse.json({
             success: true,
             notice: {

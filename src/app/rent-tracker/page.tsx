@@ -17,8 +17,6 @@ import { toast } from "sonner"
 import { supabase } from "@/lib/supabaseClient"
 import { usePathname } from "next/navigation"
 import { useAuth } from "@/contexts/AuthContext"
-import { calculateRentalLogic, type RentalLogicResult } from "@/hooks/useRentalLogic"
-import type { StrikeRecord, NoticeType } from "@/lib/legal-engine"
 import { calculateTenantStatus, type TenantStatusResult } from "@/lib/status-calculator"
 import { toRentSettings, toPayments } from "@/lib/rent-calculator"
 
@@ -29,7 +27,6 @@ export default function RentTrackerPage() {
     const { profile } = useAuth();
     const [properties, setProperties] = useState<Property[]>([]);
     const [payments, setPayments] = useState<RentPayment[]>([]);
-    const [strikeHistories, setStrikeHistories] = useState<Record<string, StrikeRecord[]>>({});
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [isAddPropertyOpen, setIsAddPropertyOpen] = useState(false);
@@ -83,6 +80,9 @@ export default function RentTrackerPage() {
                         startDate: t.lease_start_date,
                         trackingStartDate: t.tracking_start_date, // CRITICAL: When we started tracking (for legal engine)
                         openingArrears: t.opening_arrears || 0,   // CRITICAL: Pre-existing debt (for legal engine)
+                        arrearsStartDate: t.arrears_start_date || undefined,  // Back-calculated overdue start
+                        settingsEffectiveDate: t.settings_effective_date || undefined,
+                        carriedForwardBalance: t.carried_forward_balance || 0,
                         rentDueDay: t.rent_due_day || "Wednesday",
                         sentNotices: t.sent_notices || [],        // 90-day rolling strike history
                         remedyNoticeSentAt: t.remedy_notice_sent_at, // 14-day notice to remedy
@@ -165,47 +165,6 @@ export default function RentTrackerPage() {
             document.removeEventListener('visibilitychange', handleVisibilityChange);
         };
     }, [fetchProperties, fetchPayments]);
-
-    // Fetch strike histories for legal compliance
-    useEffect(() => {
-        const fetchStrikeHistories = async () => {
-            if (!properties.length) return;
-
-            console.log('📊 Fetching strike histories for RTA compliance...');
-            const histories: Record<string, StrikeRecord[]> = {};
-
-            for (const property of properties) {
-                for (const tenant of property.tenants) {
-                    const { data, error } = await supabase.rpc('get_notice_timeline', {
-                        p_tenant_id: tenant.id
-                    });
-
-                    if (error) {
-                        console.error(`Error fetching strikes for ${tenant.name}:`, error);
-                        continue;
-                    }
-
-                    if (data) {
-                        histories[tenant.id] = data
-                            .filter((n: any) => n.is_strike)
-                            .map((n: any) => ({
-                                noticeId: n.notice_id,
-                                sentDate: n.sent_at,
-                                officialServiceDate: n.official_service_date,
-                                type: n.notice_type as NoticeType,
-                                rentDueDate: n.rent_due_date,
-                                amountOwed: n.amount_owed,
-                            }));
-                    }
-                }
-            }
-
-            setStrikeHistories(histories);
-            console.log('✅ Strike histories loaded:', Object.keys(histories).length, 'tenants');
-        };
-
-        fetchStrikeHistories();
-    }, [properties]);
 
     // Auto-generate payment records for all tenants
     const autoGeneratePayments = async () => {
@@ -611,31 +570,6 @@ export default function RentTrackerPage() {
     }, [properties.length, totalTenantCount, loading, testDate]); // Include testDate to re-generate when date changes
 
     // Calculate RTA-compliant legal status for each tenant
-    const tenantLegalStatuses = useMemo(() => {
-        const statuses: Record<string, RentalLogicResult> = {};
-
-        properties.forEach(property => {
-            property.tenants.forEach(tenant => {
-                const tenantPayments = payments.filter(p => p.tenantId === tenant.id);
-                const strikeHistory = strikeHistories[tenant.id] || [];
-
-                statuses[tenant.id] = calculateRentalLogic({
-                    tenantId: tenant.id,
-                    payments: tenantPayments,
-                    strikeHistory,
-                    region: property.region || 'Auckland',
-                    currentDate: testDate || undefined,
-                    trackingStartDate: tenant.trackingStartDate || tenant.startDate, // When we started tracking (or lease start as fallback)
-                    openingArrears: tenant.openingArrears || 0, // Any existing debt when we started tracking
-                    frequency: tenant.frequency, // For firstMissedDueDate calculation
-                    rentDueDay: tenant.rentDueDay, // For firstMissedDueDate calculation
-                });
-            });
-        });
-
-        return statuses;
-    }, [properties, payments, strikeHistories, testDate]);
-
     // Calculate unified tenant status from status-calculator (Session 4+)
     // This is the SINGLE SOURCE OF TRUTH for severity, strikes, notices, and display text.
     const tenantStatuses = useMemo(() => {
@@ -650,7 +584,8 @@ export default function RentTrackerPage() {
                     rentAmount: tenant.rentAmount,
                     rentDueDay: tenant.rentDueDay,
                     trackingStartDate: tenant.trackingStartDate || tenant.startDate,
-                    openingArrears: tenant.openingArrears
+                    openingArrears: tenant.openingArrears,
+                    arrearsStartDate: tenant.arrearsStartDate
                 });
 
                 const tenantPayments = payments.filter(p => p.tenantId === tenant.id);
@@ -1573,6 +1508,10 @@ export default function RentTrackerPage() {
                                 onDeleteTenant={handleDeleteTenant}
                                 onAddTenant={handleAddTenant}
                                 onDeleteProperty={handleDeleteProperty}
+                                onNoticeSent={async () => {
+                                    await fetchProperties();
+                                    await fetchPayments();
+                                }}
                             />
                         ))}
                     </div>

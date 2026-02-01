@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { format, differenceInCalendarDays, parseISO, isPast, isFuture } from "date-fns";
 import { supabase } from "@/lib/supabaseClient";
+import { useAuth } from "@/contexts/AuthContext";
 import {
     calculateOfficialServiceDate,
     calculateRemedyExpiryDate,
@@ -24,6 +25,15 @@ import {
     Loader2,
     Scale,
     FileText,
+    Download,
+    Truck,
+    Mailbox,
+    Hand,
+    Pencil,
+    ChevronDown,
+    ChevronUp,
+    RefreshCw,
+    Eye,
 } from "lucide-react";
 
 interface StrikeInfo {
@@ -60,9 +70,11 @@ interface NoticePreviewProps {
     strikeNumber?: number;
     rentDueDate?: string;
     amountOwed?: number;
+    rentAmount?: number;
     breachDescription?: string;
     onSendSuccess?: (noticeId: string) => void;
     onClose?: () => void;
+    testDate?: Date;
 }
 
 export function NoticePreview({
@@ -76,10 +88,13 @@ export function NoticePreview({
     strikeNumber,
     rentDueDate,
     amountOwed,
+    rentAmount,
     breachDescription,
     onSendSuccess,
     onClose,
+    testDate,
 }: NoticePreviewProps) {
+    const { profile } = useAuth();
     const [strikeInfo, setStrikeInfo] = useState<StrikeInfo | null>(null);
     const [timeline, setTimeline] = useState<TimelineEvent[]>([]);
     const [loading, setLoading] = useState(true);
@@ -87,9 +102,110 @@ export function NoticePreview({
     const [error, setError] = useState<string | null>(null);
     const [sentNoticeId, setSentNoticeId] = useState<string | null>(null);
     const [showConfirmationModal, setShowConfirmationModal] = useState(false);
+    const [showDeliveryPicker, setShowDeliveryPicker] = useState(false);
+    const [downloading, setDownloading] = useState(false);
+    const [showFieldEditor, setShowFieldEditor] = useState(false);
+    const [fieldOverrides, setFieldOverrides] = useState<Record<string, string>>({});
+    const [pdfPreviewUrl, setPdfPreviewUrl] = useState<string | null>(null);
+    const [isLoadingPreview, setIsLoadingPreview] = useState(false);
+    const [previewOutdated, setPreviewOutdated] = useState(false);
+    const prevUrlRef = useRef<string | null>(null);
 
-    // Calculate preview dates
-    const previewSentTime = new Date().toISOString();
+    // Initialize field overrides from props
+    useEffect(() => {
+        const defaults: Record<string, string> = {
+            tenantName: tenantName || "",
+            propertyAddress: propertyAddress || "",
+            landlordName: profile?.full_name || "",
+            landlordPhone: profile?.phone || "",
+            landlordEmail: profile?.email || "",
+        };
+        if (noticeType === "S55_STRIKE") {
+            defaults.rentDueDate = rentDueDate || "";
+            defaults.rentAmount = rentAmount?.toFixed(2) || "";
+            defaults.amountOwed = amountOwed?.toFixed(2) || "";
+            defaults.landlordMobile = "";
+            defaults.landlordAddress = profile?.service_address || "";
+        } else if (noticeType === "S56_REMEDY") {
+            defaults.tenantAddress = propertyAddress || "";
+            defaults.amountOwed = amountOwed?.toFixed(2) || "";
+        }
+        setFieldOverrides(defaults);
+    }, [tenantName, propertyAddress, rentDueDate, rentAmount, amountOwed, noticeType, profile]);
+
+    const updateField = (key: string, value: string) => {
+        setFieldOverrides(prev => ({ ...prev, [key]: value }));
+        setPreviewOutdated(true);
+    };
+
+    // Build shared request body for all API calls
+    const buildRequestBody = useCallback((extra: Record<string, unknown> = {}) => ({
+        tenantId,
+        propertyId,
+        tenantEmail,
+        tenantName,
+        propertyAddress,
+        region,
+        noticeType,
+        strikeNumber,
+        rentDueDate,
+        rentAmount,
+        amountOwed,
+        breachDescription,
+        landlordName: profile?.full_name || undefined,
+        landlordPhone: profile?.phone || undefined,
+        landlordEmail: profile?.email || undefined,
+        landlordAddress: profile?.service_address || undefined,
+        testDate: testDate?.toISOString() || undefined,
+        fieldOverrides,
+        firstStrikeDate: strikeInfo?.first_strike_date || undefined,
+        previousNotices: strikeInfo?.strikes
+            ?.filter(s => s.strike_number < (strikeNumber || 0))
+            .map(s => ({ date: format(parseISO(s.official_service_date), "dd/MM/yyyy") })) || undefined,
+        ...extra,
+    }), [tenantId, propertyId, tenantEmail, tenantName, propertyAddress, region, noticeType, strikeNumber, rentDueDate, rentAmount, amountOwed, breachDescription, profile, testDate, fieldOverrides, strikeInfo]);
+
+    // Generate PDF preview
+    const generatePreview = useCallback(async () => {
+        if (noticeType !== "S55_STRIKE" && noticeType !== "S56_REMEDY") return;
+        setIsLoadingPreview(true);
+        try {
+            const response = await fetch("/api/send-notice", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(buildRequestBody({ downloadOnly: true })),
+            });
+            if (!response.ok) return;
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            // Revoke previous URL
+            if (prevUrlRef.current) URL.revokeObjectURL(prevUrlRef.current);
+            prevUrlRef.current = url;
+            setPdfPreviewUrl(url);
+            setPreviewOutdated(false);
+        } catch (err) {
+            console.error("Preview generation failed:", err);
+        } finally {
+            setIsLoadingPreview(false);
+        }
+    }, [buildRequestBody, noticeType]);
+
+    // Auto-generate preview once strike info is loaded
+    useEffect(() => {
+        if (!loading && (noticeType === "S55_STRIKE" || noticeType === "S56_REMEDY")) {
+            generatePreview();
+        }
+    }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // Cleanup blob URL on unmount
+    useEffect(() => {
+        return () => {
+            if (prevUrlRef.current) URL.revokeObjectURL(prevUrlRef.current);
+        };
+    }, []);
+
+    // Calculate preview dates (use testDate if provided for testing future scenarios)
+    const previewSentTime = (testDate || new Date()).toISOString();
     const previewOSD = calculateOfficialServiceDate(previewSentTime, region);
     const previewExpiryDate = noticeType === "S56_REMEDY"
         ? calculateRemedyExpiryDate(previewOSD)
@@ -156,31 +272,82 @@ export function NoticePreview({
             const response = await fetch("/api/send-notice", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    tenantId,
-                    propertyId,
-                    tenantEmail,
-                    tenantName,
-                    propertyAddress,
-                    region,
-                    noticeType,
-                    strikeNumber,
-                    rentDueDate,
-                    amountOwed,
-                    breachDescription,
-                }),
+                body: JSON.stringify(buildRequestBody()),
             });
 
             const data = await response.json();
 
             if (!response.ok) {
-                throw new Error(data.error || "Failed to send notice");
+                throw new Error(data.details ? `${data.error}: ${data.details}` : data.error || "Failed to send notice");
             }
 
             setSentNoticeId(data.notice.id);
             onSendSuccess?.(data.notice.id);
 
             // Refresh data
+            await fetchStrikeInfo();
+        } catch (err: any) {
+            setError(err.message);
+        } finally {
+            setSending(false);
+        }
+    };
+
+    // Download PDF only (no DB record, no email)
+    const handleDownloadPDF = async () => {
+        try {
+            setDownloading(true);
+            setError(null);
+
+            const response = await fetch("/api/send-notice", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(buildRequestBody({ downloadOnly: true })),
+            });
+
+            if (!response.ok) {
+                const data = await response.json();
+                throw new Error(data.error || "Failed to generate PDF");
+            }
+
+            // Response is PDF binary when downloadOnly=true
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `Notice_${tenantName.replace(/\s+/g, "_")}_${format(new Date(), "yyyy-MM-dd")}.pdf`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        } catch (err: any) {
+            setError(err.message);
+        } finally {
+            setDownloading(false);
+        }
+    };
+
+    // Mark as manually sent with a specific delivery method
+    const handleManualSend = async (deliveryMethod: "hand" | "post" | "letterbox") => {
+        try {
+            setSending(true);
+            setError(null);
+
+            const response = await fetch("/api/send-notice", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(buildRequestBody({ manualDelivery: true, deliveryMethod })),
+            });
+
+            const data = await response.json();
+
+            if (!response.ok) {
+                throw new Error(data.details ? `${data.error}: ${data.details}` : data.error || "Failed to record notice");
+            }
+
+            setSentNoticeId(data.notice.id);
+            setShowDeliveryPicker(false);
+            onSendSuccess?.(data.notice.id);
             await fetchStrikeInfo();
         } catch (err: any) {
             setError(err.message);
@@ -296,6 +463,51 @@ export function NoticePreview({
                 </div>
             )}
 
+            {/* PDF Preview */}
+            {(noticeType === "S55_STRIKE" || noticeType === "S56_REMEDY") && (
+                <div className="px-6 py-4 border-b border-slate-100">
+                    <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider flex items-center gap-2">
+                            <Eye className="w-4 h-4" />
+                            PDF Preview
+                        </h3>
+                        <div className="flex items-center gap-2">
+                            {previewOutdated && !isLoadingPreview && (
+                                <span className="text-[10px] text-amber-600 font-medium">Fields changed</span>
+                            )}
+                            <button
+                                onClick={generatePreview}
+                                disabled={isLoadingPreview}
+                                className="flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 disabled:text-slate-400 transition-colors"
+                            >
+                                <RefreshCw className={`w-3 h-3 ${isLoadingPreview ? "animate-spin" : ""}`} />
+                                {isLoadingPreview ? "Generating..." : "Refresh"}
+                            </button>
+                        </div>
+                    </div>
+                    <div className="rounded-lg border border-slate-200 overflow-hidden bg-slate-100" style={{ height: "400px" }}>
+                        {isLoadingPreview && !pdfPreviewUrl ? (
+                            <div className="flex flex-col items-center justify-center h-full gap-2">
+                                <Loader2 className="w-6 h-6 animate-spin text-slate-400" />
+                                <span className="text-sm text-slate-500">Generating preview...</span>
+                            </div>
+                        ) : pdfPreviewUrl ? (
+                            <iframe
+                                src={pdfPreviewUrl}
+                                width="100%"
+                                height="100%"
+                                title="Notice PDF Preview"
+                                className="border-0"
+                            />
+                        ) : (
+                            <div className="flex items-center justify-center h-full text-sm text-slate-400">
+                                Preview not available
+                            </div>
+                        )}
+                    </div>
+                </div>
+            )}
+
             {/* Timeline Preview */}
             <div className="px-6 py-4 border-b border-slate-100">
                 <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3 flex items-center gap-2">
@@ -389,6 +601,73 @@ export function NoticePreview({
                 </div>
             </div>
 
+            {/* Editable PDF Fields */}
+            {(noticeType === "S55_STRIKE" || noticeType === "S56_REMEDY") && (
+                <div className="border-b border-slate-100">
+                    <button
+                        onClick={() => setShowFieldEditor(!showFieldEditor)}
+                        className="w-full px-6 py-3 flex items-center justify-between text-sm font-semibold text-slate-500 hover:bg-slate-50 transition-colors"
+                    >
+                        <div className="flex items-center gap-2">
+                            <Pencil className="w-4 h-4" />
+                            <span>Edit PDF Fields</span>
+                        </div>
+                        {showFieldEditor ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </button>
+
+                    {showFieldEditor && (
+                        <div className="px-6 pb-4 space-y-4">
+                            {/* Tenant & Property */}
+                            <FieldGroup title="Tenant & Property">
+                                <FieldInput label="Tenant Name" value={fieldOverrides.tenantName} onChange={v => updateField("tenantName", v)} />
+                                {noticeType === "S56_REMEDY" && (
+                                    <FieldInput label="Tenant Address" value={fieldOverrides.tenantAddress} onChange={v => updateField("tenantAddress", v)} />
+                                )}
+                                <FieldInput label="Property Address" value={fieldOverrides.propertyAddress} onChange={v => updateField("propertyAddress", v)} />
+                            </FieldGroup>
+
+                            {/* Rent Details */}
+                            <FieldGroup title="Rent Details">
+                                {noticeType === "S55_STRIKE" && (
+                                    <>
+                                        <FieldInput label="Rent Due Date" value={fieldOverrides.rentDueDate} onChange={v => updateField("rentDueDate", v)} placeholder="dd/MM/yyyy" />
+                                        <FieldInput label="Rent Amount" value={fieldOverrides.rentAmount} onChange={v => updateField("rentAmount", v)} prefix="$" />
+                                    </>
+                                )}
+                                <FieldInput label="Amount Owed" value={fieldOverrides.amountOwed} onChange={v => updateField("amountOwed", v)} prefix="$" />
+                            </FieldGroup>
+
+                            {/* Payment Info (Remedy only) */}
+                            {noticeType === "S56_REMEDY" && (
+                                <FieldGroup title="Payment Info">
+                                    <FieldInput label="Last Payment Amount" value={fieldOverrides.lastPaymentAmount} onChange={v => updateField("lastPaymentAmount", v)} prefix="$" placeholder="Auto-detected" />
+                                    <FieldInput label="Last Payment Date" value={fieldOverrides.lastPaymentDate} onChange={v => updateField("lastPaymentDate", v)} placeholder="dd/MM/yyyy" />
+                                    <FieldInput label="Payment Deadline" value={fieldOverrides.paymentDeadline} onChange={v => updateField("paymentDeadline", v)} placeholder="Auto-calculated" />
+                                    <FieldInput label="Next Rent Due Date" value={fieldOverrides.nextRentDueDate} onChange={v => updateField("nextRentDueDate", v)} placeholder="Auto-calculated" />
+                                </FieldGroup>
+                            )}
+
+                            {/* Landlord Details */}
+                            <FieldGroup title="Landlord Details">
+                                <FieldInput label="Landlord Name" value={fieldOverrides.landlordName} onChange={v => updateField("landlordName", v)} />
+                                <FieldInput label="Phone" value={fieldOverrides.landlordPhone} onChange={v => updateField("landlordPhone", v)} />
+                                {noticeType === "S55_STRIKE" && (
+                                    <FieldInput label="Mobile" value={fieldOverrides.landlordMobile} onChange={v => updateField("landlordMobile", v)} />
+                                )}
+                                <FieldInput label="Email" value={fieldOverrides.landlordEmail} onChange={v => updateField("landlordEmail", v)} />
+                                {noticeType === "S55_STRIKE" && (
+                                    <FieldInput label="Address" value={fieldOverrides.landlordAddress} onChange={v => updateField("landlordAddress", v)} />
+                                )}
+                            </FieldGroup>
+
+                            <p className="text-[10px] text-slate-400">
+                                Empty fields will use auto-calculated values. Dates should be in dd/MM/yyyy format.
+                            </p>
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Error Display */}
             {error && (
                 <div className="px-6 py-3 bg-red-50 border-b border-red-100">
@@ -409,26 +688,112 @@ export function NoticePreview({
                 </div>
             )}
 
-            {/* Actions */}
-            <div className="px-6 py-4 bg-white flex items-center justify-between">
-                <div className="text-xs text-slate-400">
-                    <AlertCircle className="w-3 h-3 inline mr-1" />
-                    Dates calculated by NZ legal engine (not AI)
+            {/* Delivery Method Picker */}
+            {showDeliveryPicker && !sentNoticeId && (
+                <div className="px-6 py-4 border-b border-slate-100 bg-amber-50">
+                    <h3 className="text-sm font-semibold text-slate-700 mb-3">How was this notice delivered?</h3>
+                    <p className="text-xs text-slate-500 mb-3">OSD depends on delivery method (RTA Section 136)</p>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <button
+                            onClick={() => handleManualSend("hand")}
+                            disabled={sending}
+                            className="flex items-center gap-2 p-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-left transition-colors"
+                        >
+                            <Hand className="w-4 h-4 text-green-600 shrink-0" />
+                            <div>
+                                <p className="text-sm font-semibold text-slate-800">Hand Delivered</p>
+                                <p className="text-[10px] text-slate-500">OSD = today (before 5 PM)</p>
+                            </div>
+                        </button>
+                        <button
+                            onClick={() => handleManualSend("letterbox")}
+                            disabled={sending}
+                            className="flex items-center gap-2 p-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-left transition-colors"
+                        >
+                            <Mailbox className="w-4 h-4 text-blue-600 shrink-0" />
+                            <div>
+                                <p className="text-sm font-semibold text-slate-800">Letterbox</p>
+                                <p className="text-[10px] text-slate-500">OSD = today + 2 working days</p>
+                            </div>
+                        </button>
+                        <button
+                            onClick={() => handleManualSend("post")}
+                            disabled={sending}
+                            className="flex items-center gap-2 p-3 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-left transition-colors"
+                        >
+                            <Truck className="w-4 h-4 text-orange-600 shrink-0" />
+                            <div>
+                                <p className="text-sm font-semibold text-slate-800">Posted</p>
+                                <p className="text-[10px] text-slate-500">OSD = today + 4 working days</p>
+                            </div>
+                        </button>
+                    </div>
+                    <button
+                        onClick={() => setShowDeliveryPicker(false)}
+                        className="mt-2 text-xs text-slate-400 hover:text-slate-600"
+                    >
+                        Cancel
+                    </button>
                 </div>
-                <div className="flex gap-3">
+            )}
+
+            {/* Actions */}
+            <div className="px-6 py-4 bg-white">
+                <div className="flex items-center justify-between mb-3">
+                    <div className="text-xs text-slate-400">
+                        <AlertCircle className="w-3 h-3 inline mr-1" />
+                        Dates calculated by NZ legal engine (not AI)
+                    </div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2">
                     {onClose && (
                         <Button
                             variant="ghost"
                             onClick={onClose}
-                            disabled={sending}
+                            disabled={sending || downloading}
+                            className="sm:order-1"
                         >
                             Cancel
                         </Button>
                     )}
+
+                    {/* Download PDF Only */}
+                    {!sentNoticeId && (noticeType === "S55_STRIKE" || noticeType === "S56_REMEDY") && (
+                        <Button
+                            variant="outline"
+                            onClick={handleDownloadPDF}
+                            disabled={sending || downloading || !!sentNoticeId}
+                            className="sm:order-2 text-slate-700 border-slate-300"
+                        >
+                            {downloading ? (
+                                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                            ) : (
+                                <Download className="w-4 h-4 mr-2" />
+                            )}
+                            Download PDF
+                        </Button>
+                    )}
+
+                    {/* Download & Mark as Sent (manual delivery) */}
+                    {!sentNoticeId && (noticeType === "S55_STRIKE" || noticeType === "S56_REMEDY") && (
+                        <Button
+                            variant="outline"
+                            onClick={() => {
+                                setShowDeliveryPicker(!showDeliveryPicker);
+                            }}
+                            disabled={sending || downloading || !!sentNoticeId}
+                            className="sm:order-3 text-slate-700 border-slate-300"
+                        >
+                            <Truck className="w-4 h-4 mr-2" />
+                            Manual Send
+                        </Button>
+                    )}
+
+                    {/* Send via Email */}
                     <Button
                         onClick={() => setShowConfirmationModal(true)}
-                        disabled={sending || !!sentNoticeId}
-                        className={`${
+                        disabled={sending || downloading || !!sentNoticeId}
+                        className={`sm:order-4 flex-1 ${
                             isAboutToBeThirdStrike
                                 ? "bg-overdue-red hover:bg-overdue-red/90"
                                 : "bg-nav-black hover:bg-black"
@@ -447,7 +812,7 @@ export function NoticePreview({
                         ) : (
                             <>
                                 <Send className="w-4 h-4 mr-2" />
-                                Approve & Send
+                                Send via Email
                             </>
                         )}
                     </Button>
@@ -507,6 +872,38 @@ function TimelineItem({
                 </div>
                 <p className="text-sm font-medium">{date}{time && ` at ${time}`}</p>
                 {description && <p className="text-xs opacity-75 mt-0.5">{description}</p>}
+            </div>
+        </div>
+    );
+}
+
+// Helper components for field editor
+function FieldGroup({ title, children }: { title: string; children: React.ReactNode }) {
+    return (
+        <div>
+            <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">{title}</h4>
+            <div className="grid grid-cols-2 gap-2">{children}</div>
+        </div>
+    );
+}
+
+function FieldInput({
+    label, value, onChange, prefix, placeholder,
+}: {
+    label: string; value: string | undefined; onChange: (v: string) => void; prefix?: string; placeholder?: string;
+}) {
+    return (
+        <div>
+            <label className="text-[11px] text-slate-500 block mb-0.5">{label}</label>
+            <div className="flex items-center">
+                {prefix && <span className="text-xs text-slate-400 mr-1">{prefix}</span>}
+                <input
+                    type="text"
+                    value={value || ""}
+                    onChange={e => onChange(e.target.value)}
+                    placeholder={placeholder}
+                    className="w-full text-sm px-2 py-1 border border-slate-200 rounded bg-white text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-400 focus:border-blue-400"
+                />
             </div>
         </div>
     );

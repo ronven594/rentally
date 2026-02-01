@@ -138,8 +138,11 @@ export async function regeneratePaymentLedger(
                 : settings.rentDueDay
         };
 
+        console.log('🔍 DEBUG: Parsing trackingStartDate:', settings.trackingStartDate);
         const trackingStart = parseDateISO(settings.trackingStartDate);
+        console.log('🔍 DEBUG: Parsed trackingStart:', trackingStart, 'isValid:', !isNaN(trackingStart.getTime()));
         const firstDueDate = findFirstDueDate(trackingStart, dueDateSettings);
+        console.log('🔍 DEBUG: firstDueDate:', firstDueDate, 'isValid:', !isNaN(firstDueDate.getTime()));
 
         console.log('📍 Ground Zero:', format(firstDueDate, 'yyyy-MM-dd (EEEE)'));
 
@@ -171,9 +174,9 @@ export async function regeneratePaymentLedger(
                 property_id: settings.propertyId,
                 due_date: format(currentDue, 'yyyy-MM-dd'),
                 amount: settings.rentAmount,
-                // Status is 'Pending' - actual display status is derived at render time
-                // from calculateRentState() via deriveLedgerRecordStatus()
-                status: 'Pending',
+                // Status is 'Unpaid' (display-only) - actual display status is derived
+                // at render time from calculateRentState() via deriveLedgerRecordStatus()
+                status: 'Unpaid',
                 amount_paid: 0,
                 paid_date: null
             });
@@ -209,6 +212,8 @@ export async function regeneratePaymentLedger(
 
                 if (insertError) {
                     console.error('❌ Failed to insert batch:', insertError);
+                    console.error('❌ DEBUG: Batch that failed:', JSON.stringify(batch[0], null, 2));
+                    console.error('❌ DEBUG: Insert error details:', JSON.stringify(insertError, null, 2));
                     return {
                         success: false,
                         recordsDeleted: recordsToDelete,
@@ -234,6 +239,7 @@ export async function regeneratePaymentLedger(
 
     } catch (error: any) {
         console.error('❌ Ledger regeneration failed:', error);
+        console.error('❌ DEBUG: Error name:', error?.name, 'message:', error?.message, 'stack:', error?.stack);
         return {
             success: false,
             recordsDeleted: 0,

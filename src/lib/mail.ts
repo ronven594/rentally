@@ -66,16 +66,20 @@ export async function sendNoticeEmailWithAttachment(
     to: string,
     subject: string,
     coverNote: string,
-    attachment: EmailAttachment
+    attachment: EmailAttachment,
+    additionalAttachments?: EmailAttachment[]
 ) {
     const isDev = process.env.NODE_ENV === 'development';
+    const allAttachments = [attachment, ...(additionalAttachments || [])];
 
     if (isDev) {
         console.log('✉️ [DEVELOPMENT MODE: MAIL LOG WITH ATTACHMENT]');
         console.log(`To: ${to}`);
         console.log(`Subject: ${subject}`);
         console.log(`Cover Note: ${coverNote.substring(0, 200)}...`);
-        console.log(`Attachment: ${attachment.filename} (${typeof attachment.content === 'string' ? attachment.content.length : attachment.content.length} bytes)`);
+        allAttachments.forEach(a => {
+            console.log(`Attachment: ${a.filename} (${typeof a.content === 'string' ? a.content.length : a.content.length} bytes)`);
+        });
         console.log('-------------------------------');
         return { success: true, mode: 'development', attachmentFilename: attachment.filename };
     }
@@ -86,23 +90,20 @@ export async function sendNoticeEmailWithAttachment(
     }
 
     try {
-        // Convert Buffer to base64 if needed
-        const contentBase64 = Buffer.isBuffer(attachment.content)
-            ? attachment.content.toString('base64')
-            : attachment.content;
+        const resendAttachments = allAttachments.map(a => ({
+            filename: a.filename,
+            content: Buffer.isBuffer(a.content)
+                ? a.content.toString('base64')
+                : a.content,
+            contentType: a.contentType || 'application/pdf',
+        }));
 
         const { data, error } = await resend.emails.send({
             from: 'Landlord App <onboarding@resend.dev>',
             to: [to],
             subject: subject,
             html: coverNote,
-            attachments: [
-                {
-                    filename: attachment.filename,
-                    content: contentBase64,
-                    contentType: attachment.contentType || 'application/pdf',
-                },
-            ],
+            attachments: resendAttachments,
         });
 
         if (error) {
@@ -110,7 +111,7 @@ export async function sendNoticeEmailWithAttachment(
             return { success: false, error };
         }
 
-        console.log(`✅ Email with attachment sent successfully! ID: ${data?.id}`);
+        console.log(`✅ Email with ${allAttachments.length} attachment(s) sent successfully! ID: ${data?.id}`);
         return { success: true, id: data?.id, attachmentFilename: attachment.filename };
     } catch (err: any) {
         console.error('❌ Mail Service Exception:', err.message);

@@ -7,6 +7,9 @@ export interface StrikeNotice {
     type: 'STRIKE_1' | 'STRIKE_2' | 'STRIKE_3' | 'REMEDY_NOTICE';
     sentAt: string; // ISO date string (YYYY-MM-DD)
     officialServiceDate: string; // ISO date string - when notice was officially served
+    /** Which specific rent due date this strike is for (YYYY-MM-DD).
+     *  RTA requires each strike to be for a DIFFERENT due date. */
+    dueDateFor?: string;
 }
 
 export interface PaymentHistoryEntry {
@@ -28,6 +31,9 @@ export interface Tenant {
     startDate?: string; // Lease start date (when tenant moved in)
     trackingStartDate?: string; // When we started tracking this tenant in the app (YYYY-MM-DD)
     openingArrears?: number; // Any existing debt when we started tracking (defaults to 0)
+    arrearsStartDate?: string; // Back-calculated date when historical debt originated (YYYY-MM-DD)
+    settingsEffectiveDate?: string; // When current rent settings took effect (YYYY-MM-DD)
+    carriedForwardBalance?: number; // Frozen balance from before last settings change
     sentNotices?: StrikeNotice[]; // 90-day rolling strike history
     remedyNoticeSentAt?: string; // ISO date string (YYYY-MM-DD) - 14-day notice to remedy
     paymentHistory?: PaymentHistoryEntry[]; // Record of all payments received

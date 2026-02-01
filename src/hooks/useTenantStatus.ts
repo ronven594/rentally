@@ -74,7 +74,8 @@ export function useTenantStatusFromTenant(
             rentAmount: tenant.rentAmount,
             rentDueDay: tenant.rentDueDay,
             trackingStartDate: tenant.trackingStartDate,
-            openingArrears: tenant.openingArrears
+            openingArrears: tenant.openingArrears,
+            arrearsStartDate: tenant.arrearsStartDate
         });
 
         const payments = toPayments(

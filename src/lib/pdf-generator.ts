@@ -2,27 +2,41 @@
  * PDF Notice Generator
  *
  * Uses pdf-lib to load official NZ Tenancy Services PDF templates
- * and overlay tenant data at the correct positions.
+ * and fill their form fields programmatically.
  *
  * Templates:
- * - notice-of-overdue-rent.pdf (S55 Strike Notice)
- * - 14-day-Notice-to-remedy-rent-arrears-handwritten-letter-template.pdf (S56 Remedy Notice)
+ * - notice-of-overdue-rent.pdf (S55 Strike Notice) — 22 form fields
+ * - 14-day-Notice-to-remedy-rent-arrears-handwritten-letter-template.pdf (S56 Remedy Notice) — 21 form fields
  */
 
-import { PDFDocument, rgb, StandardFonts } from "pdf-lib";
+import { PDFDocument, PDFFont, rgb, StandardFonts } from "pdf-lib";
 import { readFile } from "fs/promises";
 import path from "path";
 import { format } from "date-fns";
+
+/**
+ * Calculate the largest font size that fits text within a given width.
+ * Steps down by 0.5pt until it fits, with a minimum floor.
+ */
+function fontSizeToFit(
+    text: string,
+    font: PDFFont,
+    maxWidth: number,
+    maxSize: number = 10,
+    minSize: number = 4,
+): number {
+    let size = maxSize;
+    while (size > minSize) {
+        if (font.widthOfTextAtSize(text, size) <= maxWidth) return size;
+        size -= 0.5;
+    }
+    return minSize;
+}
 
 // Template paths
 const TEMPLATES_DIR = path.join(process.cwd(), "_templates");
 const STRIKE_NOTICE_TEMPLATE = "notice-of-overdue-rent.pdf";
 const REMEDY_NOTICE_TEMPLATE = "14-day-Notice-to-remedy-rent-arrears-handwritten-letter-template.pdf";
-
-// Text styling
-const TEXT_COLOR = rgb(0, 0, 0); // Black
-const FONT_SIZE = 11;
-const SMALL_FONT_SIZE = 10;
 
 interface StrikeNoticeData {
     date: string; // Notice date
@@ -62,235 +76,216 @@ interface RemedyNoticeData {
 }
 
 /**
- * Generates a Strike Notice PDF (S55) with tenant data overlaid on the template
+ * Generates a Strike Notice PDF (S55) by filling template form fields
+ *
+ * Field mapping (from labeled template inspection):
+ *   Page 1: Text01=Date, Text02=Tenant name, Text03=Tenancy address,
+ *           Text04=Rent due date, Text05=Rent amount, Text06=Amount owed,
+ *           Text07=first/second/third, Text08=90-day start date,
+ *           Text09=First notice date, Text10=Second notice date,
+ *           Text11="first" or "first and second",
+ *           Check Box05=Third strike tick
+ *   Page 2: Text12=Phone, Text13=Mobile, Text14=Email, Text15=Address,
+ *           Text16=Landlord name, Text20=Delivery date,
+ *           Check Box01=mail, Check Box02=letterbox,
+ *           Check Box03=email after 5pm, Check Box04=hand/email before 5pm
  */
 export async function generateStrikeNoticePDF(data: StrikeNoticeData): Promise<Uint8Array> {
-    // Load the template
     const templatePath = path.join(TEMPLATES_DIR, STRIKE_NOTICE_TEMPLATE);
     const templateBytes = await readFile(templatePath);
     const pdfDoc = await PDFDocument.load(templateBytes);
+    const form = pdfDoc.getForm();
 
-    // Get the first page
-    const pages = pdfDoc.getPages();
-    const page1 = pages[0];
-    const page2 = pages.length > 1 ? pages[1] : null;
+    // Page 1 fields
+    form.getTextField("Text01").setText(data.date);
+    form.getTextField("Text02").setText(data.tenantName);
+    form.getTextField("Text03").setText(data.propertyAddress);
+    form.getTextField("Text04").setText(data.rentDueDate);
+    form.getTextField("Text05").setText(data.rentAmount.toFixed(2));
+    form.getTextField("Text06").setText(data.amountOwed.toFixed(2));
 
-    // Embed font
-    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-    // Page dimensions (A4)
-    const { height } = page1.getSize();
-
-    // Helper to draw text at specific coordinates
-    // Note: PDF coordinates start from bottom-left, so we use (height - y) for top-down positioning
-    const drawText = (page: typeof page1, text: string, x: number, y: number, options?: { size?: number; bold?: boolean }) => {
-        page.drawText(text, {
-            x,
-            y: height - y,
-            size: options?.size || FONT_SIZE,
-            font: options?.bold ? boldFont : font,
-            color: TEXT_COLOR,
-        });
-    };
-
-    // === PAGE 1: Main Notice Content ===
-
-    // Date field (top of form)
-    drawText(page1, data.date, 75, 107);
-
-    // Tenant name (Dear [tenant])
-    drawText(page1, data.tenantName, 165, 130);
-
-    // Tenancy address
-    drawText(page1, data.propertyAddress, 175, 152);
-
-    // Rent due date (This notice is to advise you that on [date])
-    drawText(page1, data.rentDueDate, 245, 175);
-
-    // Rent amount (your regular rent of $[amount] was due)
-    drawText(page1, data.rentAmount.toFixed(2), 445, 175);
-
-    // Amount owed (The amount of rent... that has remained unpaid is $[amount])
-    drawText(page1, data.amountOwed.toFixed(2), 52, 248);
-
-    // Strike number (first, second, or third)
     const strikeText = data.strikeNumber === 1 ? "first" : data.strikeNumber === 2 ? "second" : "third";
-    drawText(page1, strikeText, 190, 270);
+    form.getTextField("Text07").setText(strikeText);
 
-    // 90-day period start date
     if (data.firstStrikeDate) {
-        drawText(page1, data.firstStrikeDate, 105, 295);
+        form.getTextField("Text08").setText(data.firstStrikeDate);
     }
 
-    // Previous notices section (if applicable)
-    if (data.previousNotices && data.previousNotices.length > 0) {
-        // First notice date
-        if (data.previousNotices[0]) {
-            drawText(page1, data.previousNotices[0].date, 115, 380);
+    // Previous notices - Strike 1 gets "N/A" since there are no previous notices
+    if (data.strikeNumber === 1) {
+        form.getTextField("Text09").setText("N/A");
+        form.getTextField("Text10").setText("N/A");
+        form.getTextField("Text11").setText("N/A");
+    } else {
+        if (data.previousNotices && data.previousNotices.length > 0) {
+            if (data.previousNotices[0]) {
+                form.getTextField("Text09").setText(data.previousNotices[0].date);
+            }
+            if (data.previousNotices[1]) {
+                form.getTextField("Text10").setText(data.previousNotices[1].date);
+            }
         }
-        // Second notice date
-        if (data.previousNotices[1]) {
-            drawText(page1, data.previousNotices[1].date, 120, 402);
+
+        // "I enclose a copy of the [first / first and second] notice"
+        if (data.strikeNumber === 2) {
+            form.getTextField("Text11").setText("first");
+        } else if (data.strikeNumber === 3) {
+            form.getTextField("Text11").setText("first and second");
         }
     }
 
-    // Third strike checkbox (tick if this is the third strike)
+    // Embed font for auto-sizing and N/A drawing
+    const helvetica = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
+    // "Tick if applicable" checkbox for third strike declaration
+    // AUDIT: Check Box01 is on Page 0 (y=142.6) = third-strike tick
     if (data.strikeNumber === 3) {
-        // Draw a checkmark in the checkbox area
-        drawText(page1, "✓", 55, 465, { size: 14, bold: true });
-    }
-
-    // === PAGE 2: Contact Details and Delivery ===
-    if (page2) {
-        const { height: h2 } = page2.getSize();
-        const drawText2 = (text: string, x: number, y: number, options?: { size?: number; bold?: boolean }) => {
-            page2.drawText(text, {
-                x,
-                y: h2 - y,
-                size: options?.size || FONT_SIZE,
-                font: options?.bold ? boldFont : font,
-                color: TEXT_COLOR,
+        form.getCheckBox("Check Box01").check();
+    } else {
+        // Draw "N/A" on page 0 near Check Box01 for Strike 1/2
+        const cb1 = form.getCheckBox("Check Box01");
+        const cb1Widget = cb1.acroField.getWidgets()[0];
+        if (cb1Widget) {
+            const rect = cb1Widget.getRectangle();
+            const page0 = pdfDoc.getPages()[0];
+            page0.drawText("N/A", {
+                x: rect.x + 2,
+                y: rect.y + 2,
+                size: 9,
+                font: helvetica,
+                color: rgb(0.3, 0.3, 0.3),
             });
-        };
-
-        // Contact details
-        if (data.landlordPhone) {
-            drawText2(data.landlordPhone, 80, 52);
-        }
-        if (data.landlordMobile) {
-            drawText2(data.landlordMobile, 420, 52);
-        }
-        if (data.landlordEmail) {
-            drawText2(data.landlordEmail, 80, 75);
-        }
-        if (data.landlordAddress) {
-            drawText2(data.landlordAddress, 80, 98);
-        }
-
-        // Landlord name (Yours sincerely)
-        drawText2(data.landlordName, 55, 142);
-
-        // Delivery date
-        drawText2(data.deliveryDate, 110, 197);
-
-        // Delivery method checkboxes
-        const checkmarkY = {
-            mail: 230,
-            letterbox: 250,
-            email_after_5pm: 280,
-            email_before_5pm: 310,
-            hand_delivered: 310,
-        };
-
-        // Draw checkmark for selected delivery method
-        const methodY = checkmarkY[data.deliveryMethod];
-        if (methodY) {
-            drawText2("✓", 55, methodY, { size: 14, bold: true });
         }
     }
 
-    // Save and return the modified PDF
+    // Page 2 fields
+    if (data.landlordPhone) {
+        form.getTextField("Text12").setText(data.landlordPhone);
+    }
+    if (data.landlordMobile) {
+        form.getTextField("Text13").setText(data.landlordMobile);
+    }
+    if (data.landlordEmail) {
+        const emailField = form.getTextField("Text14");
+        // AUDIT: Text14 width = 417.5pt — auto-fit font size
+        emailField.setFontSize(fontSizeToFit(data.landlordEmail, helvetica, 410));
+        emailField.setText(data.landlordEmail);
+    }
+    if (data.landlordAddress) {
+        const addrField = form.getTextField("Text15");
+        // AUDIT: Text15 width = 417.5pt
+        addrField.setFontSize(fontSizeToFit(data.landlordAddress, helvetica, 410));
+        addrField.setText(data.landlordAddress);
+    }
+    form.getTextField("Text16").setText(data.landlordName);
+    form.getTextField("Text20").setText(data.deliveryDate);
+
+    // Delivery method checkboxes (all on Page 1)
+    // AUDIT: CB02=mail(y=447), CB03=letterbox(y=423), CB04=email after 5pm(y=396), CB05=email before 5pm/hand(y=365)
+    const deliveryCheckboxMap: Record<string, string> = {
+        mail: "Check Box02",
+        letterbox: "Check Box03",
+        email_after_5pm: "Check Box04",
+        email_before_5pm: "Check Box05",
+        hand_delivered: "Check Box05",
+    };
+    const checkboxName = deliveryCheckboxMap[data.deliveryMethod];
+    if (checkboxName) {
+        form.getCheckBox(checkboxName).check();
+    }
+
+    // Flatten so fields render as static text in all viewers
+    form.flatten();
+
     const pdfBytes = await pdfDoc.save();
     return pdfBytes;
 }
 
 /**
- * Generates a 14-Day Remedy Notice PDF (S56) with tenant data overlaid
+ * Generates a 14-Day Remedy Notice PDF (S56) by filling template form fields
+ *
+ * Field mapping (from labeled template inspection):
+ *   Text01=Date, Text02=Tenant name, Text03=Tenant address,
+ *   Text04=Dear [name], Text05=Tenancy at [address],
+ *   Text05a=Amount owed, Text06=Last payment amount, Text07=Last payment date,
+ *   Text08=Total to pay, Text09=Payment deadline, Text10=Next rent due date,
+ *   Text11=Phone, Text12=Email, Text13=Landlord name,
+ *   Text19=Delivery day, Text20=Delivery month, Text21=Delivery year,
+ *   Check Box01=mail, Check Box02=letterbox,
+ *   Check Box03=email after 5pm, Check Box04=hand/email before 5pm
  */
 export async function generateRemedyNoticePDF(data: RemedyNoticeData): Promise<Uint8Array> {
-    // Load the template
     const templatePath = path.join(TEMPLATES_DIR, REMEDY_NOTICE_TEMPLATE);
     const templateBytes = await readFile(templatePath);
     const pdfDoc = await PDFDocument.load(templateBytes);
+    const form = pdfDoc.getForm();
 
-    // Get the first page
-    const pages = pdfDoc.getPages();
-    const page1 = pages[0];
+    form.getTextField("Text01").setText(data.date);
+    form.getTextField("Text02").setText(data.tenantName);
+    form.getTextField("Text03").setText(data.tenantAddress);
+    form.getTextField("Text04").setText(data.tenantName);
+    form.getTextField("Text05").setText(data.propertyAddress);
+    form.getTextField("Text05a").setText(data.amountOwed.toFixed(2));
 
-    // Embed font
-    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
-    const boldFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-
-    const { height } = page1.getSize();
-
-    const drawText = (text: string, x: number, y: number, options?: { size?: number; bold?: boolean }) => {
-        page1.drawText(text, {
-            x,
-            y: height - y,
-            size: options?.size || FONT_SIZE,
-            font: options?.bold ? boldFont : font,
-            color: TEXT_COLOR,
-        });
-    };
-
-    // Date
-    drawText(data.date, 70, 52);
-
-    // Tenant name and address
-    drawText(data.tenantName, 110, 75);
-    drawText(data.tenantAddress, 115, 90);
-
-    // Dear [tenant name]
-    drawText(data.tenantName, 70, 118);
-
-    // Tenancy at: [property address]
-    drawText(data.propertyAddress, 100, 138);
-
-    // Amount owed (Your rent is behind by $[amount])
-    drawText(data.amountOwed.toFixed(2), 175, 162);
-
-    // Last payment amount and date
-    if (data.lastPaymentAmount !== undefined) {
-        drawText(data.lastPaymentAmount.toFixed(2), 205, 182);
+    if (data.lastPaymentAmount !== undefined && data.lastPaymentAmount > 0) {
+        form.getTextField("Text06").setText(data.lastPaymentAmount.toFixed(2));
+    } else {
+        form.getTextField("Text06").setText("N/A");
     }
     if (data.lastPaymentDate) {
-        drawText(data.lastPaymentDate, 330, 182);
+        form.getTextField("Text07").setText(data.lastPaymentDate);
+    } else {
+        form.getTextField("Text07").setText("N/A");
     }
 
-    // Payment deadline (Please pay $[amount] by [date])
-    drawText(data.amountOwed.toFixed(2), 105, 205);
-    drawText(data.paymentDeadline, 215, 205);
+    form.getTextField("Text08").setText(data.amountOwed.toFixed(2));
+    form.getTextField("Text09").setText(data.paymentDeadline);
 
-    // Next rent due date
     if (data.nextRentDueDate) {
-        drawText(data.nextRentDueDate, 265, 228);
+        form.getTextField("Text10").setText(data.nextRentDueDate);
     }
 
-    // Contact details
+    // Embed font for auto-sizing
+    const helveticaR = await pdfDoc.embedFont(StandardFonts.Helvetica);
+
     if (data.landlordPhone) {
-        drawText(data.landlordPhone, 160, 250);
+        // AUDIT: Text11 width = 123.8pt
+        const phoneField = form.getTextField("Text11");
+        phoneField.setFontSize(fontSizeToFit(data.landlordPhone, helveticaR, 120));
+        phoneField.setText(data.landlordPhone);
     }
     if (data.landlordEmail) {
-        drawText(data.landlordEmail, 330, 250);
+        // AUDIT: Text12 width = 86.8pt — narrow field, needs aggressive auto-fit
+        const emailField = form.getTextField("Text12");
+        emailField.setFontSize(fontSizeToFit(data.landlordEmail, helveticaR, 83));
+        emailField.setText(data.landlordEmail);
     }
+    form.getTextField("Text13").setText(data.landlordName);
 
-    // Landlord name
-    drawText(data.landlordName, 55, 330);
-
-    // Delivery date (format: DD/MM/YYYY)
+    // Delivery date split into DD / MM / YYYY
     const [day, month, year] = data.deliveryDate.split("/");
     if (day && month && year) {
-        drawText(day, 70, 378);
-        drawText(month, 95, 378);
-        drawText(year, 115, 378);
+        form.getTextField("Text19").setText(day);
+        form.getTextField("Text20").setText(month);
+        form.getTextField("Text21").setText(year);
     } else {
-        drawText(data.deliveryDate, 70, 378);
+        form.getTextField("Text19").setText(data.deliveryDate);
     }
 
     // Delivery method checkboxes
-    const checkmarkPositions = {
-        mail: 408,
-        letterbox: 428,
-        email_after_5pm: 460,
-        email_before_5pm: 490,
-        hand_delivered: 490,
+    const deliveryCheckboxMap: Record<string, string> = {
+        mail: "Check Box01",
+        letterbox: "Check Box02",
+        email_after_5pm: "Check Box03",
+        email_before_5pm: "Check Box04",
+        hand_delivered: "Check Box04",
     };
-
-    const methodY = checkmarkPositions[data.deliveryMethod];
-    if (methodY) {
-        drawText("✓", 55, methodY, { size: 14, bold: true });
+    const checkboxName = deliveryCheckboxMap[data.deliveryMethod];
+    if (checkboxName) {
+        form.getCheckBox(checkboxName).check();
     }
+
+    form.flatten();
 
     const pdfBytes = await pdfDoc.save();
     return pdfBytes;
@@ -299,6 +294,15 @@ export async function generateRemedyNoticePDF(data: RemedyNoticeData): Promise<U
 /**
  * Generates the appropriate notice PDF based on notice type
  */
+/** Convert yyyy-MM-dd to dd/MM/yyyy (no timezone issues) */
+function toNZDateStatic(isoDate: string | undefined): string | undefined {
+    if (!isoDate) return undefined;
+    if (isoDate.includes("/")) return isoDate;
+    const parts = isoDate.split("-");
+    if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
+    return isoDate;
+}
+
 export async function generateNoticePDF(
     noticeType: "S55_STRIKE" | "S56_REMEDY",
     data: {
@@ -321,10 +325,23 @@ export async function generateNoticePDF(
         landlordEmail?: string;
         landlordAddress?: string;
         officialServiceDate: string;
+        /** Per-due-date unpaid amount for strikes (rent for that specific due date minus partial payments) */
+        amountUnpaidForDueDate?: number;
+        testDate?: string; // ISO string override for all date fields
     }
 ): Promise<{ pdfBytes: Uint8Array; filename: string }> {
-    const today = format(new Date(), "dd/MM/yyyy");
-    const deliveryDate = format(new Date(), "dd/MM/yyyy");
+    const effectiveNow = data.testDate ? new Date(data.testDate) : new Date();
+    const today = format(effectiveNow, "dd/MM/yyyy");
+    // Delivery date = OSD (the official service date), not the notice date
+    const deliveryDate = toNZDateStatic(data.officialServiceDate) || today;
+
+    const toNZDate = toNZDateStatic;
+
+    // Determine delivery method based on whether OSD = today (before 5pm) or tomorrow (after 5pm)
+    // If OSD is same as notice date, it was sent before 5pm; if OSD is later, it was after 5pm
+    const noticeDateStr = format(effectiveNow, "yyyy-MM-dd");
+    const deliveryMethod: StrikeNoticeData["deliveryMethod"] =
+        data.officialServiceDate === noticeDateStr ? "email_before_5pm" : "email_after_5pm";
 
     if (noticeType === "S55_STRIKE") {
         const strikeData: StrikeNoticeData = {
@@ -332,9 +349,9 @@ export async function generateNoticePDF(
             tenantName: data.tenantName,
             tenantAddress: data.tenantAddress,
             propertyAddress: data.propertyAddress,
-            rentDueDate: data.rentDueDate || today,
+            rentDueDate: toNZDate(data.rentDueDate) || today,
             rentAmount: data.rentAmount || data.amountOwed,
-            amountOwed: data.amountOwed,
+            amountOwed: data.amountUnpaidForDueDate ?? data.rentAmount ?? data.amountOwed,
             strikeNumber: data.strikeNumber || 1,
             firstStrikeDate: data.firstStrikeDate,
             previousNotices: data.previousNotices,
@@ -344,13 +361,13 @@ export async function generateNoticePDF(
             landlordEmail: data.landlordEmail,
             landlordAddress: data.landlordAddress,
             deliveryDate,
-            deliveryMethod: "email_before_5pm", // Default for email delivery
+            deliveryMethod,
         };
 
         const pdfBytes = await generateStrikeNoticePDF(strikeData);
         return {
             pdfBytes,
-            filename: `Strike_${data.strikeNumber || 1}_Notice_${data.tenantName.replace(/\s+/g, "_")}_${format(new Date(), "yyyy-MM-dd")}.pdf`,
+            filename: `Strike_${data.strikeNumber || 1}_Notice_${data.tenantName.replace(/\s+/g, "_")}_${format(effectiveNow, "yyyy-MM-dd")}.pdf`,
         };
     } else {
         const remedyData: RemedyNoticeData = {
@@ -360,20 +377,20 @@ export async function generateNoticePDF(
             propertyAddress: data.propertyAddress,
             amountOwed: data.amountOwed,
             lastPaymentAmount: data.lastPaymentAmount,
-            lastPaymentDate: data.lastPaymentDate,
-            paymentDeadline: data.paymentDeadline || data.officialServiceDate,
-            nextRentDueDate: data.nextRentDueDate,
+            lastPaymentDate: toNZDate(data.lastPaymentDate),
+            paymentDeadline: toNZDate(data.paymentDeadline) || toNZDate(data.officialServiceDate) || today,
+            nextRentDueDate: toNZDate(data.nextRentDueDate),
             landlordName: data.landlordName,
             landlordPhone: data.landlordPhone,
             landlordEmail: data.landlordEmail,
             deliveryDate,
-            deliveryMethod: "email_before_5pm",
+            deliveryMethod,
         };
 
         const pdfBytes = await generateRemedyNoticePDF(remedyData);
         return {
             pdfBytes,
-            filename: `14_Day_Remedy_Notice_${data.tenantName.replace(/\s+/g, "_")}_${format(new Date(), "yyyy-MM-dd")}.pdf`,
+            filename: `14_Day_Remedy_Notice_${data.tenantName.replace(/\s+/g, "_")}_${format(effectiveNow, "yyyy-MM-dd")}.pdf`,
         };
     }
 }
