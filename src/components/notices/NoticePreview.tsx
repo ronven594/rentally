@@ -156,7 +156,7 @@ export function NoticePreview({
         landlordPhone: profile?.phone || undefined,
         landlordEmail: profile?.email || undefined,
         landlordAddress: profile?.service_address || undefined,
-        testDate: testDate?.toISOString() || undefined,
+        testDate: testDate ? format(testDate, "yyyy-MM-dd") : undefined,
         fieldOverrides,
         firstStrikeDate: strikeInfo?.first_strike_date || undefined,
         previousNotices: strikeInfo?.strikes

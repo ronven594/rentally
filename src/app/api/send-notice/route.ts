@@ -120,10 +120,12 @@ export async function POST(request: NextRequest) {
         // Test mode: use test DATE but real TIME (so 5pm cutoff works correctly)
         let effectiveNow: Date;
         if (body.testDate) {
-            const testD = new Date(body.testDate);
+            // Handle both ISO string and yyyy-MM-dd format without timezone drift
+            const dateStr = body.testDate.includes('T') ? body.testDate.split('T')[0] : body.testDate;
+            const [year, month, day] = dateStr.split('-').map(Number);
             const now = new Date();
             effectiveNow = new Date(
-                testD.getFullYear(), testD.getMonth(), testD.getDate(),
+                year, month - 1, day,
                 now.getHours(), now.getMinutes(), now.getSeconds(), now.getMilliseconds()
             );
         } else {

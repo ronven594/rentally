@@ -330,7 +330,16 @@ export async function generateNoticePDF(
         testDate?: string; // ISO string override for all date fields
     }
 ): Promise<{ pdfBytes: Uint8Array; filename: string }> {
-    const effectiveNow = data.testDate ? new Date(data.testDate) : new Date();
+    // CRITICAL: If testDate is ISO from NZ timezone, new Date() shifts day backwards
+    // (e.g. Feb 13 00:00 NZDT → Feb 12 11:00 UTC). Parse date portion only.
+    let effectiveNow: Date;
+    if (data.testDate) {
+        const dateOnly = data.testDate.substring(0, 10); // "yyyy-MM-dd"
+        const [y, m, d] = dateOnly.split("-").map(Number);
+        effectiveNow = new Date(y, m - 1, d, 12, 0, 0); // noon local avoids edge cases
+    } else {
+        effectiveNow = new Date();
+    }
     const today = format(effectiveNow, "dd/MM/yyyy");
     // Delivery date = OSD (the official service date), not the notice date
     const deliveryDate = toNZDateStatic(data.officialServiceDate) || today;
