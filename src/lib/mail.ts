@@ -34,7 +34,7 @@ export async function sendNoticeEmail(to: string, subject: string, body: string)
 
     try {
         const { data, error } = await resend.emails.send({
-            from: 'Landlord App <onboarding@resend.dev>', // Resend default for unverified domains
+            from: 'Rentally <noreply@rentally.co.nz>', // Resend default for unverified domains
             to: [to],
             subject: subject,
             html: body, // Converting the 'body' string to HTML content
@@ -99,7 +99,7 @@ export async function sendNoticeEmailWithAttachment(
         }));
 
         const { data, error } = await resend.emails.send({
-            from: 'Landlord App <onboarding@resend.dev>',
+            from: 'Rentally <noreply@rentally.co.nz>',
             to: [to],
             subject: subject,
             html: coverNote,
